@@ -130,6 +130,38 @@ pub fn create_first_user(
     Ok((identity, master_key))
 }
 
+/// Wraps an existing master key under a fresh `password_input` and returns a
+/// `UserCredential`. Used by `create_user` (wrap the firm's MK for an
+/// additional user) and by `change_password` (re-wrap the same MK under a new
+/// password). The returned credential has fresh `kek_salt` and `mk_nonce` —
+/// never reuse a nonce across different plaintexts with the same key.
+pub fn wrap_master_key_for(
+    user_id: &str,
+    firm_id: &str,
+    email: &str,
+    display_name: &str,
+    password_input: &str,
+    master_key: &[u8; MASTER_KEY_LEN],
+) -> AppResult<UserCredential> {
+    let argon2_hash = password::hash(password_input)?;
+    let kek_salt = kdf::random_salt();
+    let mut kek = [0u8; MASTER_KEY_LEN];
+    kdf::derive_key(password_input.as_bytes(), &kek_salt, &mut kek)?;
+    let mk_nonce = cipher::generate_nonce();
+    let mk_wrapped = cipher::encrypt(&kek, &mk_nonce, master_key)?;
+
+    Ok(UserCredential {
+        user_id: user_id.to_string(),
+        firm_id: firm_id.to_string(),
+        email: email.to_string(),
+        display_name: display_name.to_string(),
+        argon2_hash,
+        kek_salt: hex::encode(kek_salt),
+        mk_nonce: hex::encode(mk_nonce),
+        mk_wrapped: hex::encode(&mk_wrapped),
+    })
+}
+
 /// Verifies the password against the stored Argon2 hash, then re-derives the
 /// KEK and unwraps the master key. Verify-first gives a clean "wrong
 /// password" error before we touch the AEAD; a tag failure after a passing
@@ -204,6 +236,42 @@ mod tests {
         let cred = &identity.users[0];
         let err = unlock(cred, "stapler horse battery").unwrap_err();
         assert!(matches!(err, AppError::Unauthorised(_)));
+    }
+
+    #[test]
+    fn wrap_master_key_for_new_user_unlocks_to_same_key() {
+        let (_, mk) = create_first_user(
+            "u1",
+            "f1",
+            "owner@x.com",
+            "Owner",
+            "correct horse battery staple",
+        )
+        .unwrap();
+
+        // A second user wraps the *same* MK under a different password.
+        let second = wrap_master_key_for(
+            "u2",
+            "f1",
+            "team@x.com",
+            "Teammate",
+            "staple battery horse correct",
+            &mk,
+        )
+        .unwrap();
+
+        let recovered = unlock(&second, "staple battery horse correct").unwrap();
+        assert_eq!(mk, recovered);
+    }
+
+    #[test]
+    fn wrap_master_key_uses_fresh_salt_and_nonce() {
+        let mk = [42u8; MASTER_KEY_LEN];
+        let a = wrap_master_key_for("u", "f", "e@x.com", "N", "password123", &mk).unwrap();
+        let b = wrap_master_key_for("u", "f", "e@x.com", "N", "password123", &mk).unwrap();
+        assert_ne!(a.kek_salt, b.kek_salt);
+        assert_ne!(a.mk_nonce, b.mk_nonce);
+        assert_ne!(a.mk_wrapped, b.mk_wrapped);
     }
 
     #[test]

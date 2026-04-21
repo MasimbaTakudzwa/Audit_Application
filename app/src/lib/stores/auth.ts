@@ -48,3 +48,8 @@ export async function logout() {
   await api.logout();
   authView.set({ state: "sign_in" });
 }
+
+export async function resetIdentity(confirmation: string) {
+  await api.resetIdentity(confirmation);
+  authView.set({ state: "onboarding" });
+}

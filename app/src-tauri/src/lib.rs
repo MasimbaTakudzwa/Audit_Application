@@ -47,8 +47,16 @@ pub fn run() {
             commands::auth::onboard,
             commands::auth::login,
             commands::auth::logout,
+            commands::auth::reset_identity,
+            commands::auth::list_users,
+            commands::auth::list_roles,
+            commands::auth::create_user,
+            commands::auth::change_password,
             commands::clients::list_clients,
+            commands::clients::list_industries,
+            commands::clients::create_client,
             commands::engagements::list_engagements,
+            commands::engagements::create_engagement,
             commands::library::library_version,
         ])
         .run(tauri::generate_context!())
