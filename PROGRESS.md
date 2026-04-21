@@ -8,7 +8,7 @@ Entries are reverse-chronological. Most recent first.
 
 ## Current state
 
-**Phase**: Scaffold complete. Cross-platform Tauri 2 project under `app/` with Svelte 5 frontend and Rust backend. Database migrations for foundations + core-domain modules applied at launch. Application launches to a sidebar-shell UI with Dashboard / Clients / Engagements / Library / Settings routes. No real engagement flow yet.
+**Phase**: Authentication + encrypted DB live. First-run onboarding generates a random 256-bit master key, wraps it under an Argon2id-derived KEK, and persists the wrap to `identity.json`. Every subsequent sign-in unwraps the master key and opens the SQLCipher DB; logout drops the connection and re-locks the file. Application launches into an `AuthGate` → Shell pipeline with Dashboard / Clients / Engagements / Library / Settings routes.
 
 **Repo / scaffolding**: Git initialised at project root. Toolchain installed (Rust 1.95 stable, Node 25). See `SETUP.md` for how to run.
 
@@ -25,21 +25,101 @@ Entries are reverse-chronological. Most recent first.
 - `app/` — Tauri project
   - `app/src/` — Svelte 5 + TypeScript + Vite frontend
   - `app/src-tauri/` — Rust backend
+    - `app/src-tauri/src/auth/` — session state (`AuthState`) + on-disk identity vault (`keyvault`)
     - `app/src-tauri/src/commands/` — Tauri commands per module
-    - `app/src-tauri/src/db/` — SQLite connection + 7 migrations
-    - `app/src-tauri/src/crypto/` — AES-256-GCM, Argon2id, OS keychain
+    - `app/src-tauri/src/db/` — SQLCipher connection (`Option<Connection>`, open-with-key) + 7 migrations
+    - `app/src-tauri/src/crypto/` — AES-256-GCM, Argon2id (KDF + password verifier), OS keychain
     - `app/src-tauri/src/models/` — Rust structs per module
+    - `app/src-tauri/src/paths.rs` — `AppPaths` (app data dir + db path)
+
+**On disk**:
+- `{app_data_dir}/identity.json` — plaintext JSON holding login material: `argon2_hash`, `kek_salt`, `mk_nonce`, `mk_wrapped`. Must be plaintext because it is read *before* the DB is unlocked.
+- `{app_data_dir}/audit.db` — SQLCipher-encrypted DB. Unreadable without the master key recovered from `identity.json` + correct password.
 
 **Immediate next up**:
-1. **Auth flow** — first-run user/firm creation with Argon2id verifier and master-key wrap. Enables SQLCipher keying.
-2. **First engagement creation** — exercises `SyncRecord`, `ChangeLog`, `ActivityLog` together. First real mutation path.
-3. **User access review vertical slice** — the recommended first prototype module (exercises 10 of 13 modules).
-4. **Extend `DATA_MODEL.md` to Modules 6–9** (Testing, Evidence, Findings, Working Papers).
-5. **Library bundle format** — how a library version ships between releases.
+1. **First engagement creation** — exercises `SyncRecord`, `ChangeLog`, `ActivityLog` together. First real mutation path. Now has an attributable `Session` and keyed DB to write against.
+2. **User access review vertical slice** — the recommended first prototype module (exercises 10 of 13 modules).
+3. **Extend `DATA_MODEL.md` to Modules 6–9** (Testing, Evidence, Findings, Working Papers).
+4. **Library bundle format** — how a library version ships between releases.
+5. **Password change** — rekey the wrapped master key under a new KEK. Not hard — the pattern is already in place.
+6. **Schema cleanup** — drop the now-redundant `User.argon2_hash` and `User.master_key_wrapped` columns (authoritative copies live in `identity.json`).
 
 ---
 
 ## Decision log
+
+### 2026-04-21 — SQLCipher keying wired
+
+The DB file is now unreadable at rest without the user's password. Ends the "scaffold DB is unencrypted" footnote from the earlier milestone.
+
+**Two-keys design**:
+- **Master key (MK)** — a random 32-byte key. This is what SQLCipher uses as the page encryption key.
+- **Key-encryption key (KEK)** — derived on demand from the user's password + a per-user salt via Argon2id with `Params::default()` (m=19456 KiB, t=2, p=1). Used only to wrap/unwrap MK.
+- On onboard: generate random MK, derive KEK from password, encrypt MK with AES-256-GCM, store `(kek_salt, mk_nonce, mk_wrapped)` in `identity.json`.
+- On login: fetch identity, verify Argon2 hash, re-derive KEK, decrypt MK, `PRAGMA key` the DB with MK.
+- On logout: drop the Connection — SQLCipher forgets MK, the file re-locks.
+
+**Why a plaintext identity file and not a second encrypted DB**:
+- Login must read the argon2 hash + wrapped MK *before* the main DB can be opened. They cannot live inside the encrypted DB they are used to unlock. A small plaintext JSON is the simplest container for pre-unlock metadata.
+- Argon2id makes the hash safe to leave on disk — brute-forcing a strong password against it is intentionally expensive.
+- Future multi-user-on-one-local-DB is trivial to support: append another entry to `identity.users`, each wrapping the *same* MK under its own password. The current UI still enforces single user.
+
+**New code**:
+- `src-tauri/src/auth/keyvault.rs` — `Identity` + `UserCredential` structs, `create_first_user()`, `unlock()`, `load/save/exists/find_by_email`. Binary fields are hex-encoded (hex is already a dep; no new base64 dependency).
+- `src-tauri/src/paths.rs` — `AppPaths { app_data_dir, db_path }`. Resolved once in setup, Tauri-managed. Keeps command handlers from dragging in `AppHandle`.
+- `src-tauri/src/db/mod.rs` — `DbState` now wraps `Mutex<Option<Connection>>` so the DB is genuinely closed between logins. Public API: `new`, `open_with_key(path, &[u8; 32])`, `close`, `with(&Connection)`, `with_mut(&mut Connection)`. The `open_with_key` flow runs `PRAGMA key = "x'...'"` before any other access, then does a test read against `sqlite_master` to surface a wrong-key failure as `AppError::Crypto("database key rejected")` instead of letting migrations hit a confusing parse error.
+
+**Changed code**:
+- `src-tauri/src/lib.rs` — no longer calls `db::initialise(app)` eagerly. Setup just creates the data dir and installs three managed states: `AppPaths`, an empty `DbState`, and an empty `AuthState`. The DB is opened on onboard/login and dropped on logout.
+- `src-tauri/src/commands/auth.rs` — rewritten around keyvault + `AppPaths`. `auth_status` now gates on `keyvault::exists()`, not `User` row count (the DB isn't open yet at that point). `onboard` purges any stale unkeyed `audit.db` left over from the previous phase, generates the identity, opens the keyed DB, seeds the Firm + User, and only then persists `identity.json` (so a failed seed leaves no orphan identity). `login` loads identity, unlocks MK, opens the DB, updates `last_seen_at`. `logout` closes the DB and clears the session.
+- `src-tauri/src/commands/{clients,engagements}.rs` — migrated from `db.conn.lock()` to `db.with(|conn| ...)`. Same query bodies.
+
+**Verified**:
+- `cargo test` — 11 passing, up from 5. New tests: `db::tests::keyed_db_migrations_and_roundtrip` (open a keyed DB, run migrations, insert, close, reopen with same key, read back), `db::tests::wrong_key_rejected`, `db::tests::with_closed_db_returns_unauthorised`, plus 3 keyvault roundtrip tests.
+- `cargo check` — clean.
+- `svelte-check` — 91 files, 0 errors, 0 warnings.
+
+**Dev migration note**: Anyone who ran the earlier scaffold has an unencrypted `audit.db` at `{app_data_dir}/`. On the first run of this version, `onboard` detects the file (no `identity.json` exists, but `audit.db` does) and removes it before creating the new keyed DB. No dev data is at risk — the scaffold never held real data — but log lines note the purge.
+
+**Deliberately out of scope here**:
+- Password change / rekey. Pattern is straightforward: decrypt MK with old KEK, derive new KEK from new password, re-wrap. Not needed until users can actually change their passwords from the UI.
+- Zeroising MK in memory. The `zeroize` crate would help but SQLCipher holds the key internally too; a separate pass to add `ZeroizeOnDrop` to buffers can come later.
+- Dropping `User.argon2_hash` and `User.master_key_wrapped`. Still populated on onboard (satisfies `NOT NULL`); authoritative copies are in `identity.json`. A future migration will remove the columns.
+
+### 2026-04-21 — Authentication flow wired
+
+First real feature fill-in. Every mutation command from here on can recover a `Session` and write attributable rows.
+
+**Backend**:
+- `src-tauri/src/auth/mod.rs` — `AuthState` holds `parking_lot::Mutex<Option<Session>>`. Registered as Tauri-managed state in `lib::run`. `AuthState::require()` returns `AppError::Unauthorised` when the lock is empty — this becomes the gate for every mutation command.
+- `src-tauri/src/crypto/password.rs` — Argon2id PHC-format hash + verify. Separate from `crypto::kdf` (which derives raw key bytes for file/DB encryption); this module only produces verifier strings that live in `User.argon2_hash`.
+- `src-tauri/src/commands/auth.rs` — four commands:
+  - `auth_status` — returns one of `onboarding_required` / `sign_in_required` / `signed_in { user }` based on `User` row count and current `AuthState`. The frontend picks the right screen from this.
+  - `onboard` — validates input, hashes password (outside the DB lock — argon2 takes hundreds of ms), generates UUID v7 ids, inserts `Firm` + `User` in a transaction, assigns `role-partner`, sets the session.
+  - `login` — fetches the user's stored hash, releases the DB lock, verifies outside the critical section, then updates `last_seen_at` and sets the session.
+  - `logout` — clears the session.
+- The `User.master_key_wrapped` column is populated with 60 random bytes as a placeholder. The SQLCipher keying step will replace this with the real wrapped key and remove the placeholder.
+- Serde tagged enum `#[serde(tag = "kind", rename_all = "snake_case")]` produces `{kind: "onboarding_required"}` etc. on the wire. Matches the Svelte discriminated-union style on the frontend.
+
+**Frontend**:
+- `src/lib/stores/auth.ts` — `authView` writable store with four states (`loading` / `onboarding` / `sign_in` / `signed_in`). Exports `refreshAuth`, `onboard`, `login`, `logout` that call the typed API and transition the store.
+- `src/lib/components/AuthGate.svelte` — mounts once, calls `refreshAuth()`, then routes to `Onboarding`, `SignIn`, or the app shell depending on state. Wrapped around `<Shell>` in `App.svelte`.
+- `src/lib/routes/Onboarding.svelte` — firm name, country, display name, email, password. "Begin" creates the firm and signs the user in.
+- `src/lib/routes/SignIn.svelte` — email + password. "Continue" verifies and signs in.
+- `src/lib/components/Shell.svelte` — sidebar footer now shows the signed-in user (display name + email) with a "Sign out" button above the theme toggle.
+
+**Design choices**:
+- **No password recovery.** A recovery path would undermine the crypto since the password derives the DB/file keys. Recovery means wiping the local DB; sync recovery belongs to the sync/portal story, not here.
+- **No cross-launch session persistence.** Every launch prompts sign-in. Safer for an audit tool — a recovered or shared device cannot silently impersonate.
+- **Single user per local DB, for now.** The schema already supports multi-user in a firm (the sync story adds more users), but the onboarding UI enforces one. Multi-user provisioning comes later with roles + invites.
+- **Session shape deliberately thin** — user id, firm id, display name, email. No role, no permissions: commands look those up per-call so stale cache can't grant privileges. The wrapped master key will be added here once SQLCipher keying lands.
+- **Hash outside the DB lock, always.** Argon2 is intentionally slow; holding a mutex across it would serialise every concurrent command behind a login.
+
+**Verified**:
+- `cargo test` — 5 passing (crypto round-trip, KDF determinism, 3 Argon2 password tests).
+- `cargo check` — 0 errors, 0 warnings.
+- `svelte-check` — 91 files, 0 errors, 0 warnings.
+- `npm run build` — 56KB JS / 12KB CSS, 326ms.
 
 ### 2026-04-21 — Full dev scaffold committed
 

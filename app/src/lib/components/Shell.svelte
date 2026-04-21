@@ -2,6 +2,7 @@
   import type { Snippet } from "svelte";
   import { currentRoute, type RouteId } from "../stores/router";
   import { theme, toggleTheme } from "../stores/theme";
+  import { authView, logout } from "../stores/auth";
 
   type Props = { children: Snippet };
   let { children }: Props = $props();
@@ -13,6 +14,16 @@
     { id: "library",     label: "Library" },
     { id: "settings",    label: "Settings" },
   ];
+
+  let signingOut = $state(false);
+  async function handleLogout() {
+    signingOut = true;
+    try {
+      await logout();
+    } finally {
+      signingOut = false;
+    }
+  }
 </script>
 
 <div class="shell">
@@ -36,10 +47,26 @@
     </nav>
 
     <div class="footer">
-      <button class="theme-toggle" onclick={toggleTheme} type="button">
-        {$theme === "dark" ? "Light" : "Dark"} mode
-      </button>
-      <span class="version faint">v0.1.0</span>
+      {#if $authView.state === "signed_in"}
+        <div class="user">
+          <span class="user-name">{$authView.session.display_name}</span>
+          <span class="user-email faint">{$authView.session.email}</span>
+          <button
+            class="sign-out"
+            onclick={handleLogout}
+            type="button"
+            disabled={signingOut}
+          >
+            {signingOut ? "Signing out..." : "Sign out"}
+          </button>
+        </div>
+      {/if}
+      <div class="footer-row">
+        <button class="theme-toggle" onclick={toggleTheme} type="button">
+          {$theme === "dark" ? "Light" : "Dark"} mode
+        </button>
+        <span class="version faint">v0.1.0</span>
+      </div>
     </div>
   </aside>
 
@@ -111,9 +138,53 @@
   .footer {
     margin-top: auto;
     display: flex;
+    flex-direction: column;
+    gap: var(--sp-4);
+  }
+  .footer-row {
+    display: flex;
     align-items: center;
     justify-content: space-between;
     gap: var(--sp-3);
+  }
+  .user {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: var(--sp-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+  .user-name {
+    font-size: 13px;
+    color: var(--text);
+    font-weight: 500;
+  }
+  .user-email {
+    font-size: 11px;
+    font-family: var(--font-mono);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sign-out {
+    margin-top: var(--sp-2);
+    background: transparent;
+    border: 0;
+    border-top: 1px solid var(--border);
+    padding: var(--sp-2) 0 0;
+    color: var(--text-muted);
+    font-size: 12px;
+    text-align: left;
+    cursor: pointer;
+    transition: color 120ms var(--ease);
+  }
+  .sign-out:hover {
+    color: var(--text);
+  }
+  .sign-out:disabled {
+    opacity: 0.5;
+    cursor: progress;
   }
   .theme-toggle {
     background: transparent;

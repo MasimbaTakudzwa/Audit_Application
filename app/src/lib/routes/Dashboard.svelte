@@ -1,19 +1,22 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api, type HealthStatus, type CurrentUser } from "../api/tauri";
+  import { api, type HealthStatus } from "../api/tauri";
+  import { authView } from "../stores/auth";
 
   let status = $state<HealthStatus | null>(null);
-  let user = $state<CurrentUser | null>(null);
   let err = $state<string>("");
 
   onMount(async () => {
     try {
       status = await api.ping();
-      user = await api.currentUser();
     } catch (e) {
       err = String(e);
     }
   });
+
+  let session = $derived(
+    $authView.state === "signed_in" ? $authView.session : null,
+  );
 </script>
 
 <header>
@@ -42,13 +45,17 @@
   <div class="card">
     <span class="label">Session</span>
     <p class="stat">
-      {#if user?.signed_in}
-        {user.display_name}
+      {#if session}
+        {session.display_name}
       {:else}
         <span class="faint">Not signed in</span>
       {/if}
     </p>
-    <p class="faint">Authentication wiring arrives with the first engagement flow.</p>
+    {#if session}
+      <p class="faint">{session.email}</p>
+    {:else}
+      <p class="faint">Sign in to continue.</p>
+    {/if}
   </div>
 
   <div class="card">

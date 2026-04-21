@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod auth;
 pub mod clients;
 pub mod engagements;
 pub mod evidence;

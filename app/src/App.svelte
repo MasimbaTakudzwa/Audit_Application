@@ -1,4 +1,5 @@
 <script lang="ts">
+  import AuthGate from "./lib/components/AuthGate.svelte";
   import Shell from "./lib/components/Shell.svelte";
   import Dashboard from "./lib/routes/Dashboard.svelte";
   import Clients from "./lib/routes/Clients.svelte";
@@ -8,16 +9,18 @@
   import { currentRoute } from "./lib/stores/router";
 </script>
 
-<Shell>
-  {#if $currentRoute === "dashboard"}
-    <Dashboard />
-  {:else if $currentRoute === "clients"}
-    <Clients />
-  {:else if $currentRoute === "engagements"}
-    <Engagements />
-  {:else if $currentRoute === "library"}
-    <Library />
-  {:else if $currentRoute === "settings"}
-    <Settings />
-  {/if}
-</Shell>
+<AuthGate>
+  <Shell>
+    {#if $currentRoute === "dashboard"}
+      <Dashboard />
+    {:else if $currentRoute === "clients"}
+      <Clients />
+    {:else if $currentRoute === "engagements"}
+      <Engagements />
+    {:else if $currentRoute === "library"}
+      <Library />
+    {:else if $currentRoute === "settings"}
+      <Settings />
+    {/if}
+  </Shell>
+</AuthGate>
