@@ -36,13 +36,38 @@ Entries are reverse-chronological. Most recent first.
 - `{app_data_dir}/identity.json` — plaintext JSON holding login material: `argon2_hash`, `kek_salt`, `mk_nonce`, `mk_wrapped`. Must be plaintext because it is read *before* the DB is unlocked.
 - `{app_data_dir}/audit.db` — SQLCipher-encrypted DB. Unreadable without the master key recovered from `identity.json` + correct password.
 
-**Immediate next up**:
-1. **First engagement creation** — exercises `SyncRecord`, `ChangeLog`, `ActivityLog` together. First real mutation path. Now has an attributable `Session` and keyed DB to write against.
-2. **User access review vertical slice** — the recommended first prototype module (exercises 10 of 13 modules).
-3. **Extend `DATA_MODEL.md` to Modules 6–9** (Testing, Evidence, Findings, Working Papers).
-4. **Library bundle format** — how a library version ships between releases.
-5. **Password change** — rekey the wrapped master key under a new KEK. Not hard — the pattern is already in place.
-6. **Schema cleanup** — drop the now-redundant `User.argon2_hash` and `User.master_key_wrapped` columns (authoritative copies live in `identity.json`).
+**Immediate next up** (planned 2026-04-24):
+
+**Start here — Library module**. Last commit marked this as next; it also unblocks the access review slice since risks/controls/test procedures come from the library.
+
+1. **Library bundle format** — decide the on-disk shape:
+   - JSON or YAML for authorability; signed with an Ed25519 detached signature so tampered bundles fail to load.
+   - One bundle per library version. Contains: `LibraryRisk[]`, `LibraryControl[]`, `TestProcedure[]`, `ExpectedEvidenceChecklist[]`, `FrameworkMapping[]` (schema mirrors the tables in [0006_library.sql](app/src-tauri/src/db/migrations/0006_library.sql)).
+   - Header with `version`, `published_at`, `frameworks_included`, `signature`.
+   - Ship the signer's public key in-app; private key held by Simba.
+   - Document in `NOTES.md` under a new "Library bundle format" heading.
+2. **Baseline bundle (v0.1.0)** — small, hand-curated seed covering:
+   - Generic ITGC: Access Management, Change Management, Backup & Recovery (~10 controls total).
+   - Two system types: *generic ERP* and *core banking*.
+   - Framework refs for each control: COBIT 2019 + NIST CSF (ISO 27001, PCI DSS come later).
+   - Stored at `app/src-tauri/resources/library/v0.1.0.json` (bundled with the app, not DB-seeded).
+3. **Loader** — `src-tauri/src/library/loader.rs`:
+   - Verify signature, parse, insert into library tables in a transaction.
+   - Idempotent: running with the same version is a no-op.
+   - New-version install: insert new rows, set `superseded_by` on matching prior-version entries.
+4. **Library route** — replace the placeholder in [Library.svelte](app/src/lib/routes/Library.svelte):
+   - List/detail browser across risks, controls, test procedures.
+   - Filter by framework + system type + keyword.
+   - Firm-override affordance deferred to a follow-up; read-only browse first.
+5. **Tauri commands** — extend [library.rs](app/src-tauri/src/commands/library.rs): `library_list_controls`, `library_list_risks`, `library_list_test_procedures`, `library_get_control(id)`.
+
+**Follow-ups (after Library lands)**:
+
+6. **Schema cleanup** — drop `User.argon2_hash` and `User.master_key_wrapped` (migration 0008). Authoritative copies live in `identity.json`.
+7. **Password change** — rekey the wrapped master key under a new KEK. Pattern is already in place; needs a Settings UI + `auth_change_password` command.
+8. **Extend `DATA_MODEL.md` to Modules 6–9** (Testing, Evidence, Findings, Working Papers). Needed before the access review slice.
+9. **User access review vertical slice** — the recommended first prototype module (exercises 10 of 13 modules). Starts once Library + Modules 6–9 schema are drafted.
+10. **Zeroise master key in memory** — add `ZeroizeOnDrop` to the MK buffer before it reaches SQLCipher. Defensive; not a known leak.
 
 ---
 
