@@ -101,6 +101,123 @@ export interface LibraryControlDetail {
   library_version: string;
 }
 
+export interface AddLibraryControlInput {
+  engagement_id: string;
+  library_control_id: string;
+  system_id: string | null;
+}
+
+export interface AddLibraryControlResult {
+  engagement_control_id: string;
+  engagement_risk_ids: string[];
+  test_ids: string[];
+}
+
+export interface UploadDataImportInput {
+  engagement_id: string;
+  system_id: string | null;
+  source_kind: string;
+  purpose_tag: string;
+  filename: string;
+  mime_type: string | null;
+  content: number[];
+}
+
+export interface DataImportSummary {
+  id: string;
+  filename: string | null;
+  source_kind: string;
+  purpose_tag: string | null;
+  row_count: number | null;
+  plaintext_size: number | null;
+  imported_at: number;
+  imported_by: string | null;
+  imported_by_name: string | null;
+}
+
+export interface TestSummary {
+  id: string;
+  engagement_control_id: string;
+  control_code: string;
+  control_title: string;
+  code: string;
+  name: string;
+  objective: string;
+  automation_tier: string;
+  status: string;
+  latest_result_outcome: string | null;
+  latest_result_at: number | null;
+  latest_result_evidence_count: number | null;
+}
+
+export interface RunAccessReviewInput {
+  test_id: string;
+  ad_import_id: string | null;
+  leavers_import_id: string | null;
+}
+
+export interface AccessReviewRunResult {
+  test_result_id: string;
+  outcome: string;
+  exception_count: number;
+  ad_import_id: string;
+  ad_import_filename: string | null;
+  leavers_import_id: string;
+  leavers_import_filename: string | null;
+  ad_rows_considered: number;
+  leaver_rows_considered: number;
+  ad_rows_skipped_disabled: number;
+  ad_rows_skipped_unmatchable: number;
+}
+
+export interface TestResultSummary {
+  id: string;
+  test_id: string;
+  test_code: string;
+  test_name: string;
+  outcome: string;
+  exception_summary: string | null;
+  evidence_count: number;
+  performed_at: number;
+  performed_by_name: string | null;
+  population_ref_label: string | null;
+  detail_json: string | null;
+  notes_blob_id: string | null;
+  has_linked_finding: boolean;
+}
+
+export interface ElevateFindingInput {
+  test_result_id: string;
+  title: string | null;
+  severity_id: string | null;
+}
+
+export interface FindingSummary {
+  id: string;
+  engagement_id: string;
+  code: string;
+  title: string;
+  condition_text: string | null;
+  recommendation_text: string | null;
+  severity_id: string | null;
+  severity_name: string | null;
+  status: string;
+  test_id: string | null;
+  test_code: string | null;
+  engagement_control_id: string | null;
+  control_code: string | null;
+  identified_at: number;
+  identified_by_name: string | null;
+  linked_test_result_ids: string[];
+}
+
+export interface SeveritySummary {
+  id: string;
+  name: string;
+  sort_order: number;
+  description: string | null;
+}
+
 export interface CurrentUser {
   signed_in: boolean;
   display_name: string | null;
@@ -188,4 +305,26 @@ export const api = {
     invoke<LibraryControlSummary[]>("library_list_controls"),
   libraryGetControl: (id: string) =>
     invoke<LibraryControlDetail>("library_get_control", { id }),
+  engagementAddLibraryControl: (input: AddLibraryControlInput) =>
+    invoke<AddLibraryControlResult>("engagement_add_library_control", { input }),
+  engagementUploadDataImport: (input: UploadDataImportInput) =>
+    invoke<DataImportSummary>("engagement_upload_data_import", { input }),
+  engagementListDataImports: (engagementId: string) =>
+    invoke<DataImportSummary[]>("engagement_list_data_imports", {
+      engagementId,
+    }),
+  engagementListTests: (engagementId: string) =>
+    invoke<TestSummary[]>("engagement_list_tests", { engagementId }),
+  engagementRunAccessReview: (input: RunAccessReviewInput) =>
+    invoke<AccessReviewRunResult>("engagement_run_access_review", { input }),
+  engagementListTestResults: (engagementId: string) =>
+    invoke<TestResultSummary[]>("engagement_list_test_results", {
+      engagementId,
+    }),
+  engagementElevateFinding: (input: ElevateFindingInput) =>
+    invoke<FindingSummary>("engagement_elevate_finding", { input }),
+  engagementListFindings: (engagementId: string) =>
+    invoke<FindingSummary[]>("engagement_list_findings", { engagementId }),
+  listFindingSeverities: () =>
+    invoke<SeveritySummary[]>("list_finding_severities"),
 };

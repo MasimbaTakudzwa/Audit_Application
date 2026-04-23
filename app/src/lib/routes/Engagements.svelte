@@ -5,6 +5,7 @@
     type ClientSummary,
     type EngagementSummary,
   } from "../api/tauri";
+  import { openEngagement } from "../stores/router";
 
   let engagements = $state<EngagementSummary[]>([]);
   let clients = $state<ClientSummary[]>([]);
@@ -192,6 +193,7 @@
           <th>Period</th>
           <th>Status</th>
           <th>Created</th>
+          <th class="actions-col"></th>
         </tr>
       </thead>
       <tbody>
@@ -202,6 +204,11 @@
             <td class="muted">{e.fiscal_year ?? "—"}</td>
             <td class="accent">{e.status}</td>
             <td class="faint">{fmt(e.created_at)}</td>
+            <td class="actions-col">
+              <button type="button" class="link" onclick={() => openEngagement(e.id)}>
+                Open →
+              </button>
+            </td>
           </tr>
         {/each}
       </tbody>
@@ -302,4 +309,19 @@
     border-bottom: 1px solid var(--border);
   }
   tr:hover td { background: var(--accent-soft); }
+
+  .actions-col {
+    text-align: right;
+    width: 96px;
+  }
+  .link {
+    background: transparent;
+    border: 0;
+    padding: 0;
+    color: var(--accent);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .link:hover { text-decoration: underline; }
 </style>
