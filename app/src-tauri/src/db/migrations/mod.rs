@@ -11,6 +11,7 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
     (6, "library", include_str!("0006_library.sql")),
     (7, "activity_log", include_str!("0007_activity_log.sql")),
     (8, "testing_findings", include_str!("0008_testing_findings.sql")),
+    (9, "evidence", include_str!("0009_evidence.sql")),
 ];
 
 pub fn run(conn: &Connection) -> AppResult<()> {

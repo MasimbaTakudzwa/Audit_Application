@@ -4,6 +4,7 @@
     api,
     type DataImportSummary,
     type EngagementSummary,
+    type EvidenceSummary,
     type FindingSummary,
     type LibraryControlSummary,
     type SeveritySummary,
@@ -46,6 +47,22 @@
   let results = $state<TestResultSummary[]>([]);
   let findings = $state<FindingSummary[]>([]);
   let severities = $state<SeveritySummary[]>([]);
+  let evidence = $state<EvidenceSummary[]>([]);
+
+  // Evidence upload form state.
+  let showEvidenceUpload = $state(false);
+  let submittingEvidence = $state(false);
+  let evidenceUploadErr = $state("");
+  let evTitle = $state("");
+  let evDescription = $state("");
+  let evObtainedFrom = $state("");
+  let evTestId = $state<string>("");
+  let evFile = $state<File | null>(null);
+  let evFileInput: HTMLInputElement | null = $state(null);
+
+  // Per-row download state to disable the button while bytes are fetched.
+  let downloadingEvidenceId = $state<string | null>(null);
+  let downloadErr = $state("");
 
   // Elevation state — keyed by test_result id to avoid blocking the whole table.
   let elevatingResultId = $state<string | null>(null);
@@ -95,7 +112,7 @@
     loading = true;
     err = "";
     try {
-      const [all, dataImports, testList, resultList, findingList, severityList] =
+      const [all, dataImports, testList, resultList, findingList, severityList, evidenceList] =
         await Promise.all([
           api.listEngagements(),
           api.engagementListDataImports(id),
@@ -103,6 +120,7 @@
           api.engagementListTestResults(id),
           api.engagementListFindings(id),
           api.listFindingSeverities(),
+          api.engagementListEvidence(id),
         ]);
       const match = all.find((e) => e.id === id);
       if (!match) {
@@ -116,6 +134,7 @@
       results = resultList;
       findings = findingList;
       severities = severityList;
+      evidence = evidenceList;
     } catch (e) {
       err = String(e);
     } finally {
@@ -172,6 +191,7 @@
         content,
       });
       imports = [row, ...imports];
+      evidence = await api.engagementListEvidence(engagement.id);
       showUpload = false;
       selectedFile = null;
       if (fileInput) fileInput.value = "";
@@ -294,16 +314,108 @@
         ad_import_id: null,
         leavers_import_id: null,
       });
-      const [refreshedTests, refreshedResults] = await Promise.all([
+      const [refreshedTests, refreshedResults, refreshedEvidence] = await Promise.all([
         api.engagementListTests(engagement.id),
         api.engagementListTestResults(engagement.id),
+        api.engagementListEvidence(engagement.id),
       ]);
       tests = refreshedTests;
       results = refreshedResults;
+      evidence = refreshedEvidence;
     } catch (e) {
       runErr = String(e);
     } finally {
       runningTestId = null;
+    }
+  }
+
+  function openEvidenceUpload() {
+    showEvidenceUpload = true;
+    evidenceUploadErr = "";
+    evTitle = "";
+    evDescription = "";
+    evObtainedFrom = "";
+    evTestId = "";
+    evFile = null;
+    if (evFileInput) evFileInput.value = "";
+  }
+
+  function cancelEvidenceUpload() {
+    showEvidenceUpload = false;
+    evidenceUploadErr = "";
+    evFile = null;
+    if (evFileInput) evFileInput.value = "";
+  }
+
+  function onEvidenceFileChange(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    evFile = input.files && input.files.length > 0 ? input.files[0] : null;
+  }
+
+  async function submitEvidenceUpload(event: Event) {
+    event.preventDefault();
+    if (!engagement || !evFile) return;
+    evidenceUploadErr = "";
+    submittingEvidence = true;
+    try {
+      const buf = await evFile.arrayBuffer();
+      const content = Array.from(new Uint8Array(buf));
+      const row = await api.engagementUploadEvidence({
+        engagement_id: engagement.id,
+        title: evTitle,
+        description: evDescription.trim() ? evDescription : null,
+        obtained_from: evObtainedFrom.trim() ? evObtainedFrom : null,
+        obtained_at: null,
+        test_id: evTestId || null,
+        finding_id: null,
+        filename: evFile.name,
+        mime_type: evFile.type || null,
+        content,
+      });
+      evidence = [row, ...evidence];
+      showEvidenceUpload = false;
+      evFile = null;
+      if (evFileInput) evFileInput.value = "";
+    } catch (e) {
+      evidenceUploadErr = String(e);
+    } finally {
+      submittingEvidence = false;
+    }
+  }
+
+  async function downloadEvidence(row: EvidenceSummary) {
+    if (downloadingEvidenceId) return;
+    downloadingEvidenceId = row.id;
+    downloadErr = "";
+    try {
+      const payload = await api.engagementDownloadEvidence(row.id);
+      const bytes = new Uint8Array(payload.content);
+      const blob = new Blob([bytes], {
+        type: payload.mime_type ?? "application/octet-stream",
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = payload.filename ?? `${row.id}.bin`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      downloadErr = String(e);
+    } finally {
+      downloadingEvidenceId = null;
+    }
+  }
+
+  function evidenceSourceLabel(source: string): string {
+    switch (source) {
+      case "auditor_upload":  return "Auditor upload";
+      case "data_import":     return "Data import";
+      case "matcher_report":  return "Matcher report";
+      case "client_portal":   return "Client portal";
+      case "prior_year_link": return "Prior year";
+      default:                return source.replace(/_/g, " ");
     }
   }
 
@@ -776,6 +888,138 @@
           {/each}
         </tbody>
       </table>
+    {/if}
+  </section>
+
+  <section class="block">
+    <div class="block-head">
+      <div>
+        <h2>Evidence</h2>
+        <p class="muted">
+          Every data import, matcher run, and auditor upload is tracked here with
+          its source and chain of custody. Evidence is encrypted at rest and
+          decrypted on demand when downloaded.
+        </p>
+      </div>
+      {#if !showEvidenceUpload}
+        <button type="button" class="primary" onclick={openEvidenceUpload}>
+          Upload evidence
+        </button>
+      {/if}
+    </div>
+
+    {#if showEvidenceUpload}
+      <form class="card form" onsubmit={submitEvidenceUpload}>
+        <h3>Upload evidence</h3>
+        <label>
+          <span class="label">Title</span>
+          <input type="text" bind:value={evTitle} required />
+          <span class="faint hint">
+            A short description so reviewers can find this in the list.
+          </span>
+        </label>
+        <label>
+          <span class="label">Obtained from</span>
+          <input type="text" bind:value={evObtainedFrom} placeholder="e.g. IT manager email" />
+        </label>
+        <label>
+          <span class="label">Related test</span>
+          <select bind:value={evTestId}>
+            <option value="">— Engagement-level (no specific test)</option>
+            {#each tests as t (t.id)}
+              <option value={t.id}>{t.code} · {t.name}</option>
+            {/each}
+          </select>
+        </label>
+        <label>
+          <span class="label">Description</span>
+          <textarea rows="3" bind:value={evDescription}></textarea>
+        </label>
+        <label>
+          <span class="label">File</span>
+          <input
+            type="file"
+            bind:this={evFileInput}
+            onchange={onEvidenceFileChange}
+            required
+          />
+          {#if evFile}
+            <span class="faint hint">
+              {evFile.name} · {fmtSize(evFile.size)}
+            </span>
+          {/if}
+        </label>
+        {#if evidenceUploadErr}
+          <p class="form-err">{evidenceUploadErr}</p>
+        {/if}
+        <div class="form-actions">
+          <button type="button" onclick={cancelEvidenceUpload} disabled={submittingEvidence}>
+            Cancel
+          </button>
+          <button
+            type="submit"
+            class="primary"
+            disabled={submittingEvidence || !evFile || !evTitle.trim()}
+          >
+            {submittingEvidence ? "Uploading…" : "Upload"}
+          </button>
+        </div>
+      </form>
+    {/if}
+
+    {#if evidence.length === 0 && !showEvidenceUpload}
+      <div class="card empty">
+        <h3>No evidence yet</h3>
+        <p class="muted">
+          Evidence appears here automatically when you upload a data import or run
+          a matcher. You can also upload screenshots, emails, and attestations
+          directly.
+        </p>
+      </div>
+    {:else if evidence.length > 0}
+      <table>
+        <thead>
+          <tr>
+            <th>Title</th>
+            <th>Source</th>
+            <th>File</th>
+            <th>Test</th>
+            <th>Size</th>
+            <th>Obtained</th>
+            <th class="actions-col"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each evidence as ev (ev.id)}
+            <tr>
+              <td>
+                <div>{ev.title}</div>
+                {#if ev.description}
+                  <div class="faint small">{ev.description}</div>
+                {/if}
+              </td>
+              <td class="muted">{evidenceSourceLabel(ev.source)}</td>
+              <td class="faint small">{ev.filename ?? "—"}</td>
+              <td class="muted">{ev.test_code ?? "—"}</td>
+              <td class="muted">{fmtSize(ev.plaintext_size)}</td>
+              <td class="faint">{fmtDate(ev.obtained_at)}</td>
+              <td class="actions-col">
+                <button
+                  type="button"
+                  class="link"
+                  onclick={() => downloadEvidence(ev)}
+                  disabled={downloadingEvidenceId !== null}
+                >
+                  {downloadingEvidenceId === ev.id ? "Downloading…" : "Download"}
+                </button>
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+      {#if downloadErr}
+        <p class="form-err">{downloadErr}</p>
+      {/if}
     {/if}
   </section>
 {/if}

@@ -230,6 +230,52 @@ export interface SeveritySummary {
   description: string | null;
 }
 
+export interface EvidenceSummary {
+  id: string;
+  engagement_id: string;
+  title: string;
+  description: string | null;
+  source: string;
+  filename: string | null;
+  mime_type: string | null;
+  plaintext_size: number | null;
+  test_id: string | null;
+  test_code: string | null;
+  test_result_id: string | null;
+  data_import_id: string | null;
+  obtained_at: number;
+  obtained_from: string | null;
+  created_at: number;
+  created_by_name: string | null;
+  linked_test_ids: string[];
+  linked_finding_ids: string[];
+}
+
+export interface EvidencePayload {
+  id: string;
+  filename: string | null;
+  mime_type: string | null;
+  content: number[];
+}
+
+export interface UploadEvidenceInput {
+  engagement_id: string;
+  title: string;
+  description: string | null;
+  obtained_from: string | null;
+  obtained_at: number | null;
+  test_id: string | null;
+  finding_id: string | null;
+  filename: string;
+  mime_type: string | null;
+  content: number[];
+}
+
+export interface EvidenceLinkInput {
+  finding_id: string;
+  evidence_id: string;
+}
+
 export interface CurrentUser {
   signed_in: boolean;
   display_name: string | null;
@@ -341,4 +387,16 @@ export const api = {
     invoke<FindingSummary[]>("engagement_list_findings", { engagementId }),
   listFindingSeverities: () =>
     invoke<SeveritySummary[]>("list_finding_severities"),
+  engagementListEvidence: (engagementId: string) =>
+    invoke<EvidenceSummary[]>("engagement_list_evidence", { engagementId }),
+  engagementUploadEvidence: (input: UploadEvidenceInput) =>
+    invoke<EvidenceSummary>("engagement_upload_evidence", { input }),
+  engagementDownloadEvidence: (evidenceId: string) =>
+    invoke<EvidencePayload>("engagement_download_evidence", { evidenceId }),
+  findingAttachEvidence: (input: EvidenceLinkInput) =>
+    invoke<EvidenceSummary>("finding_attach_evidence", { input }),
+  findingDetachEvidence: (input: EvidenceLinkInput) =>
+    invoke<void>("finding_detach_evidence", { input }),
+  findingListEvidence: (findingId: string) =>
+    invoke<EvidenceSummary[]>("finding_list_evidence", { findingId }),
 };

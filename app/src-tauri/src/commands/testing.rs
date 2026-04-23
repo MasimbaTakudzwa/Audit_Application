@@ -809,6 +809,40 @@ pub(crate) fn upload_data_import(
             ],
         )?;
 
+        // Auto-create a browsable Evidence row wrapping the raw upload.
+        // Source = data_import; not yet bound to a test (engagement-level).
+        crate::commands::evidence::persist_evidence(
+            &tx,
+            crate::commands::evidence::NewEvidence {
+                engagement_id: &engagement_id,
+                test_id: None,
+                test_result_id: None,
+                engagement_control_id: None,
+                blob_id: &written.id,
+                data_import_id: Some(&data_import_id),
+                title: format!("Data import — {}", filename),
+                description: None,
+                source: crate::commands::evidence::EVIDENCE_SOURCE_DATA_IMPORT,
+                obtained_from: None,
+                obtained_at: now,
+                provenance_action: "data_import",
+                provenance_actor_type: "user",
+                provenance_actor_id: Some(&session.user_id),
+                provenance_detail_json: Some(
+                    json!({
+                        "filename": filename,
+                        "purpose_tag": purpose_tag,
+                        "source_kind": source_kind,
+                        "row_count": row_count,
+                        "plaintext_size": plaintext_size,
+                    })
+                    .to_string(),
+                ),
+            },
+            &session.user_id,
+            now,
+        )?;
+
         tx.commit()?;
 
         tracing::info!(
@@ -975,16 +1009,17 @@ pub(crate) fn run_access_review(
 
         let test = tx
             .query_row(
-                "SELECT id, engagement_id, code, name, status
+                "SELECT id, engagement_id, engagement_control_id, code, name, status
                  FROM Test WHERE id = ?1",
                 params![test_id],
                 |r| {
                     Ok(TestRow {
                         id: r.get(0)?,
                         engagement_id: r.get(1)?,
-                        code: r.get(2)?,
-                        name: r.get(3)?,
-                        status: r.get(4)?,
+                        engagement_control_id: r.get(2)?,
+                        code: r.get(3)?,
+                        name: r.get(4)?,
+                        status: r.get(5)?,
                     })
                 },
             )
@@ -1281,6 +1316,69 @@ pub(crate) fn run_access_review(
             ],
         )?;
 
+        // Evidence for the matcher output itself: linked to the Test and
+        // specific TestResult so reviewers can walk from a finding back to the
+        // exact run that produced it.
+        crate::commands::evidence::persist_evidence(
+            &tx,
+            crate::commands::evidence::NewEvidence {
+                engagement_id: &engagement_id,
+                test_id: Some(&test.id),
+                test_result_id: Some(&test_result_id),
+                engagement_control_id: Some(&test.engagement_control_id),
+                blob_id: &written_report.id,
+                data_import_id: None,
+                title: format!("Matcher report — {}", test.code),
+                description: Some(exception_summary.clone()),
+                source: crate::commands::evidence::EVIDENCE_SOURCE_MATCHER_REPORT,
+                obtained_from: None,
+                obtained_at: now,
+                provenance_action: "matcher_report",
+                provenance_actor_type: "system",
+                provenance_actor_id: None,
+                provenance_detail_json: Some(
+                    json!({
+                        "rule": outcome.rule,
+                        "outcome": result_outcome,
+                        "exception_count": exception_count,
+                    })
+                    .to_string(),
+                ),
+            },
+            &session.user_id,
+            now,
+        )?;
+
+        // Link the source DataImports' Evidence rows to the test so they show
+        // up as supporting evidence (relevance = 'supporting'). The primary
+        // evidence for this test is the matcher_report row just created.
+        let ad_evidence_id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM Evidence WHERE data_import_id = ?1",
+                params![ad_import.id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(eid) = ad_evidence_id {
+            crate::commands::evidence::link_evidence_to_test(
+                &tx, &test.id, &eid, "supporting", now,
+            )?;
+        }
+        if let Some(li) = outcome.leavers_import.as_ref() {
+            let leavers_evidence_id: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM Evidence WHERE data_import_id = ?1",
+                    params![li.id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(eid) = leavers_evidence_id {
+                crate::commands::evidence::link_evidence_to_test(
+                    &tx, &test.id, &eid, "supporting", now,
+                )?;
+            }
+        }
+
         tx.commit()?;
 
         tracing::info!(
@@ -1505,6 +1603,7 @@ fn resolve_import(
 struct TestRow {
     id: String,
     engagement_id: String,
+    engagement_control_id: String,
     code: String,
     #[allow(dead_code)]
     name: String,

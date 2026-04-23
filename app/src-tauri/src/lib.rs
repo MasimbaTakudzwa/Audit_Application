@@ -74,6 +74,12 @@ pub fn run() {
             commands::findings::engagement_update_finding,
             commands::findings::engagement_list_findings,
             commands::findings::list_finding_severities,
+            commands::evidence::engagement_list_evidence,
+            commands::evidence::engagement_upload_evidence,
+            commands::evidence::engagement_download_evidence,
+            commands::evidence::finding_attach_evidence,
+            commands::evidence::finding_detach_evidence,
+            commands::evidence::finding_list_evidence,
         ])
         .run(tauri::generate_context!())
         .expect("failed to launch audit application");

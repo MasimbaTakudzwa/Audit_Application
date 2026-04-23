@@ -8,7 +8,7 @@ Entries are reverse-chronological. Most recent first.
 
 ## Current state
 
-**Phase**: First real vertical slice live — User Access Review (Module 6/7/8 ribbon). From an engagement detail page an auditor can add a library control (clones risks + tests into the engagement), upload an AD export and an HR leavers list as encrypted `DataImport`s, run a rule-based matcher — `UAM-T-001` (terminated-but-active) or `UAM-T-003` (dormant accounts) — to produce a `TestResult`, and elevate exceptions to a draft `Finding` with severity. All mutations are attributable (SyncRecord + ChangeLog + ActivityLog) and cross-firm isolated.
+**Phase**: First real vertical slice live — User Access Review (Module 6/7/8 ribbon) — plus Evidence (Module 7) browsable chain of custody. From an engagement detail page an auditor can add a library control (clones risks + tests into the engagement), upload an AD export and an HR leavers list as encrypted `DataImport`s, run a rule-based matcher — `UAM-T-001` (terminated-but-active) or `UAM-T-003` (dormant accounts) — to produce a `TestResult`, elevate exceptions to a draft `Finding` with severity, and see every raw upload, matcher report, and free-form attachment in an Evidence table with source, test linkage, and one-click download. All mutations are attributable (SyncRecord + ChangeLog + ActivityLog + EvidenceProvenance) and cross-firm isolated.
 
 Earlier foundations remain: authentication + encrypted DB, Ed25519-verified library baseline (now v0.1.0 + v0.2.0), Clients / Engagements CRUD, and the Library browse route.
 
@@ -40,10 +40,12 @@ Earlier foundations remain: authentication + encrypted DB, Ed25519-verified libr
 
 **Immediate next up**:
 
-1. **Deepen the UAR slice** — orphan-account rule (same matcher module, same test pattern), Evidence attachments on findings, CCCER-shaped finding editor (condition / criteria / cause / effect / recommendation as separate fields), and a Working Paper view that groups UAM tests. Dormant-account rule is now live (see 2026-04-24 entry below).
-2. **Schema cleanup** — drop `User.argon2_hash` and `User.master_key_wrapped` (future migration). Authoritative copies live in `identity.json`.
-3. **Password change UI** — the `change_password` command is already registered; Settings needs a form that calls it.
-4. **Zeroise master key in memory** — add `ZeroizeOnDrop` to the MK buffer before it reaches SQLCipher. Defensive; not a known leak.
+1. **More rule matchers** — change-management (`CHG-T-001`) and backup (`BKP-T-001`) are the next two to ship. Same dispatcher-through-rule-variant pattern as the two UAR rules. Orphan-accounts (AD rows with no matching HR master) is the other natural UAR extension.
+2. **CCCER-shaped finding editor** — split the flat condition/recommendation fields into condition / criteria / cause / effect / recommendation. The Finding table and `update_finding` command already carry enough data; this is a UI + model extension.
+3. **Working paper view** — one card per test, sidebar navigation grouping by control, review-note-as-margin-annotation pattern.
+4. **Schema cleanup** — drop `User.argon2_hash` and `User.master_key_wrapped` (future migration). Authoritative copies live in `identity.json`.
+5. **Password change UI** — the `change_password` command is already registered; Settings needs a form that calls it.
+6. **Zeroise master key in memory** — add `ZeroizeOnDrop` to the MK buffer before it reaches SQLCipher. Defensive; not a known leak.
 
 **Library follow-ups** (do when they become load-bearing, not before):
 
@@ -54,6 +56,48 @@ Earlier foundations remain: authentication + encrypted DB, Ed25519-verified libr
 ---
 
 ## Decision log
+
+### 2026-04-24 — Evidence module (Module 7, minimal subset)
+
+Every raw upload, matcher report, and free-form attachment is now tracked as an Evidence row with an append-only provenance chain, browsable from the engagement detail page. This is what unlocks the rest of the auditor workflow — a finding that doesn't cite the evidence behind it is useless for review.
+
+**Migration 0009** (`app/src-tauri/src/db/migrations/0009_evidence.sql`):
+- `Evidence` is the browsable face of an `EncryptedBlob`. One-to-one with a blob, many-to-one with an engagement; optionally linked to a `Test`, a specific `TestResult`, an `EngagementControl`, and/or a `DataImport`. The `source` column carries intent (`auditor_upload` / `data_import` / `matcher_report` / `client_portal` / `prior_year_link`) so reviewers can filter by provenance at a glance.
+- `TestEvidenceLink` lets a single Evidence row back several tests without duplication — `relevance` is `primary` / `supporting` / `cross_reference`, default `supporting`. The primary linkage stays on `Evidence.test_id`.
+- `FindingEvidenceLink` is the citation edge from a finding to the evidence that supports it.
+- `EvidenceProvenance` is an append-only chain of custody keyed on `(evidence_id, chain_ordinal)`. `chain_ordinal` starts at 1 (origin) and increments for every transformation (OCR, extraction, redaction, prior-year reuse). Actor type is `user` | `system` | `portal_user`. `detail_json` carries rule-specific metadata (filename, purpose_tag, exception_count, etc.).
+- **Deferred**: `PBCRequest`, `PBCStatus`, `EvidenceTag`, `PriorYearEvidenceLink`. They land when the flows that exercise them do (client portal, prior-year reuse, tagging UI).
+
+**Rust (`app/src-tauri/src/commands/evidence.rs`)**:
+- `persist_evidence(&tx, NewEvidence, actor_user_id, now) -> AppResult<String>` is the one-stop helper for inserting Evidence + origin EvidenceProvenance + SyncRecord + whole-row ChangeLog. Takes `&Transaction<'_>` so it composes cleanly inside `upload_data_import`, `run_access_review`, and the free-form `upload_evidence` flow without nested transactions.
+- `link_evidence_to_test(&tx, test_id, evidence_id, relevance, now) -> AppResult<bool>` is idempotent (returns `false` when the link already exists) so replaying a matcher run doesn't duplicate links.
+- Tauri commands: `engagement_list_evidence`, `engagement_upload_evidence`, `engagement_download_evidence`, `finding_attach_evidence`, `finding_detach_evidence`, `finding_list_evidence`. All enforce the engagement → client → firm_id chain against the session firm. Uploads require the unlocked master key (via `auth.require_keyed()`); list endpoints only require a session.
+- 25 MB upload cap mirrors the DataImport cap. Ciphertext is written via the existing `blobs::write_engagement_blob` path; the Evidence row carries `blob_id` alongside the auditor-facing metadata.
+
+**Auto-created evidence hooks in `commands/testing.rs`**:
+- `upload_data_import` now persists an Evidence row immediately after the DataImport insert: `source = data_import`, `test_id = NULL` (engagement-level), `data_import_id` set, `provenance_action = "data_import"`, `actor_type = "user"`. The raw upload is browsable from day one; a matcher run later attaches it to its test as supporting evidence.
+- `run_access_review` now persists *three* things after its TestResult insert: (a) a `matcher_report` Evidence row wrapping the JSON report blob, linked to both the Test and the specific TestResult; (b) a `TestEvidenceLink` from the Test to the AD DataImport's Evidence row; (c) the same link from the Test to the leavers DataImport's Evidence row when the rule consumed one. `actor_type = "system"` on the matcher-report provenance entry — the run is automated, not an auditor action.
+- `TestRow` gained `engagement_control_id` so the matcher-report Evidence row can carry the denormalised control id without a second query.
+
+**UI (`app/src/lib/routes/EngagementDetail.svelte`)**:
+- New Evidence section at the bottom of the engagement page. Lists title, source label, filename, linked test code, size, and obtained-at for every row. Download is a one-click action per row that calls `engagement_download_evidence`, assembles a `Blob` from the returned `Uint8Array`, and triggers a browser download with the original filename preserved.
+- Upload form supports title, description, obtained-from, optional test link, and file. Tests populate the test dropdown from the already-loaded tests list.
+- `submitUpload` (data-import flow) and `runMatcher` both now refresh the Evidence list alongside their own primary data — the auto-created rows appear without the auditor having to refresh.
+
+**TypeScript (`app/src/lib/api/tauri.ts`)**:
+- New types: `EvidenceSummary`, `EvidencePayload`, `UploadEvidenceInput`, `EvidenceLinkInput`.
+- New bindings: `engagementListEvidence`, `engagementUploadEvidence`, `engagementDownloadEvidence`, `findingAttachEvidence`, `findingDetachEvidence`, `findingListEvidence`.
+
+**Verified**:
+- `cargo test --lib commands::evidence` — five new tests: auto-Evidence on DataImport upload, matcher run creates matcher-report Evidence + links both DataImports, attach/detach finding roundtrip (idempotent), free-form upload persists + decrypts, cross-firm listing rejected with `NotFound`.
+- `cargo check --all-targets` clean.
+
+**Deliberately deferred**:
+- Attach-evidence-to-finding UI. The backend commands are wired and tested, but the finding editor doesn't surface them yet — that lands with the CCCER editor so we don't rework the same rows twice.
+- Provenance viewer. The chain is written; no UI reads it yet. Shows up when OCR or extraction actions start appending chain entries beyond the origin row.
+- Evidence tagging, PBC requests, prior-year reuse. All deferred to their own flows.
+
+**Files of note**: `app/src-tauri/src/db/migrations/0009_evidence.sql`, `app/src-tauri/src/db/migrations/mod.rs`, `app/src-tauri/src/commands/evidence.rs`, `app/src-tauri/src/commands/testing.rs`, `app/src-tauri/src/lib.rs`, `app/src/lib/api/tauri.ts`, `app/src/lib/routes/EngagementDetail.svelte`.
 
 ### 2026-04-24 — Dormant-accounts matcher + library v0.2.0
 
