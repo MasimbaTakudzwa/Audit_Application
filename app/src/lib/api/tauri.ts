@@ -200,6 +200,9 @@ export interface UpdateFindingInput {
   finding_id: string;
   title: string;
   condition_text: string | null;
+  criteria_text: string | null;
+  cause_text: string | null;
+  effect_text: string | null;
   recommendation_text: string | null;
   severity_id: string;
 }
@@ -210,6 +213,9 @@ export interface FindingSummary {
   code: string;
   title: string;
   condition_text: string | null;
+  criteria_text: string | null;
+  cause_text: string | null;
+  effect_text: string | null;
   recommendation_text: string | null;
   severity_id: string | null;
   severity_name: string | null;

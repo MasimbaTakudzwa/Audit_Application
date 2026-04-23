@@ -11,7 +11,12 @@
     type TestResultSummary,
     type TestSummary,
   } from "../api/tauri";
-  import { currentEngagementId, currentRoute } from "../stores/router";
+  import FindingEditor from "../components/FindingEditor.svelte";
+  import {
+    currentEngagementId,
+    currentRoute,
+    openWorkingPaper,
+  } from "../stores/router";
 
   type PurposeTag =
     | "ad_export"
@@ -68,14 +73,8 @@
   let elevatingResultId = $state<string | null>(null);
   let elevateErr = $state("");
 
-  // Finding editor state.
+  // Finding editor state — which finding row is expanded into the editor.
   let editingFindingId = $state<string | null>(null);
-  let editTitle = $state("");
-  let editCondition = $state("");
-  let editRecommendation = $state("");
-  let editSeverity = $state("");
-  let savingEdit = $state(false);
-  let editErr = $state("");
 
   // Upload state.
   let showUpload = $state(false);
@@ -245,40 +244,9 @@
     }
   }
 
-  function startEditFinding(f: FindingSummary) {
-    editingFindingId = f.id;
-    editTitle = f.title;
-    editCondition = f.condition_text ?? "";
-    editRecommendation = f.recommendation_text ?? "";
-    editSeverity = f.severity_id ?? (severities[0]?.id ?? "");
-    editErr = "";
-  }
-
-  function cancelEditFinding() {
+  function onFindingSaved(updated: FindingSummary) {
+    findings = findings.map((f) => (f.id === updated.id ? updated : f));
     editingFindingId = null;
-    editErr = "";
-  }
-
-  async function saveEditFinding(event: Event) {
-    event.preventDefault();
-    if (!engagement || !editingFindingId) return;
-    editErr = "";
-    savingEdit = true;
-    try {
-      const updated = await api.engagementUpdateFinding({
-        finding_id: editingFindingId,
-        title: editTitle,
-        condition_text: editCondition,
-        recommendation_text: editRecommendation,
-        severity_id: editSeverity,
-      });
-      findings = findings.map((f) => (f.id === updated.id ? updated : f));
-      editingFindingId = null;
-    } catch (e) {
-      editErr = String(e);
-    } finally {
-      savingEdit = false;
-    }
   }
 
   async function elevateFinding(result: TestResultSummary) {
@@ -680,18 +648,27 @@
                 {/if}
               </td>
               <td class="actions-col">
-                {#if t.automation_tier === "rule_based" && MATCHER_ENABLED_CODES.has(t.code)}
+                <div class="row-actions">
                   <button
                     type="button"
                     class="link"
-                    onclick={() => runMatcher(t)}
-                    disabled={runningTestId !== null}
+                    onclick={() => engagement && openWorkingPaper(engagement.id, t.id)}
                   >
-                    {runningTestId === t.id ? "Running…" : "Run matcher"}
+                    Open
                   </button>
-                {:else}
-                  <span class="faint small">manual</span>
-                {/if}
+                  {#if t.automation_tier === "rule_based" && MATCHER_ENABLED_CODES.has(t.code)}
+                    <button
+                      type="button"
+                      class="link"
+                      onclick={() => runMatcher(t)}
+                      disabled={runningTestId !== null}
+                    >
+                      {runningTestId === t.id ? "Running…" : "Run matcher"}
+                    </button>
+                  {:else}
+                    <span class="faint small">manual</span>
+                  {/if}
+                </div>
               </td>
             </tr>
           {/each}
@@ -813,46 +790,14 @@
             {#if editingFindingId === f.id}
               <tr class="editing">
                 <td colspan="8">
-                  <form class="form finding-form" onsubmit={saveEditFinding}>
-                    <h3>Edit {f.code}</h3>
-                    <label>
-                      <span class="label">Title</span>
-                      <input type="text" bind:value={editTitle} required />
-                    </label>
-                    <label>
-                      <span class="label">Severity</span>
-                      <select bind:value={editSeverity} required>
-                        {#each severities as s (s.id)}
-                          <option value={s.id}>{s.name}</option>
-                        {/each}
-                      </select>
-                    </label>
-                    <label>
-                      <span class="label">Condition</span>
-                      <textarea rows="4" bind:value={editCondition}></textarea>
-                      <span class="faint hint">
-                        What the test identified — facts, not opinion. Leave blank to clear.
-                      </span>
-                    </label>
-                    <label>
-                      <span class="label">Recommendation</span>
-                      <textarea rows="4" bind:value={editRecommendation}></textarea>
-                      <span class="faint hint">
-                        Practical remediation the auditor is asking management to do.
-                      </span>
-                    </label>
-                    {#if editErr}
-                      <p class="form-err">{editErr}</p>
-                    {/if}
-                    <div class="form-actions">
-                      <button type="button" onclick={cancelEditFinding} disabled={savingEdit}>
-                        Cancel
-                      </button>
-                      <button type="submit" class="primary" disabled={savingEdit}>
-                        {savingEdit ? "Saving…" : "Save"}
-                      </button>
-                    </div>
-                  </form>
+                  <div class="finding-form">
+                    <FindingEditor
+                      finding={f}
+                      {severities}
+                      onSaved={onFindingSaved}
+                      onCancel={() => (editingFindingId = null)}
+                    />
+                  </div>
                 </td>
               </tr>
             {:else}
@@ -874,14 +819,28 @@
                 <td class="faint">{fmtDate(f.identified_at)}</td>
                 <td class="faint">{f.identified_by_name ?? "—"}</td>
                 <td class="actions-col">
-                  <button
-                    type="button"
-                    class="link"
-                    onclick={() => startEditFinding(f)}
-                    disabled={editingFindingId !== null}
-                  >
-                    Edit
-                  </button>
+                  <div class="row-actions">
+                    {#if f.test_id && engagement}
+                      <button
+                        type="button"
+                        class="link"
+                        onclick={() =>
+                          engagement &&
+                          f.test_id &&
+                          openWorkingPaper(engagement.id, f.test_id)}
+                      >
+                        Open
+                      </button>
+                    {/if}
+                    <button
+                      type="button"
+                      class="link"
+                      onclick={() => (editingFindingId = f.id)}
+                      disabled={editingFindingId !== null}
+                    >
+                      Edit
+                    </button>
+                  </div>
                 </td>
               </tr>
             {/if}
@@ -1154,6 +1113,12 @@
   .actions-col {
     text-align: right;
     width: 140px;
+  }
+  .row-actions {
+    display: flex;
+    gap: var(--sp-3);
+    justify-content: flex-end;
+    align-items: center;
   }
   .link {
     background: transparent;

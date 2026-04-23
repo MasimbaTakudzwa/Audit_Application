@@ -47,6 +47,9 @@ pub struct UpdateFindingInput {
     pub title: String,
     /// Empty string clears the column to NULL.
     pub condition_text: Option<String>,
+    pub criteria_text: Option<String>,
+    pub cause_text: Option<String>,
+    pub effect_text: Option<String>,
     pub recommendation_text: Option<String>,
     pub severity_id: String,
 }
@@ -58,6 +61,9 @@ pub struct FindingSummary {
     pub code: String,
     pub title: String,
     pub condition_text: Option<String>,
+    pub criteria_text: Option<String>,
+    pub cause_text: Option<String>,
+    pub effect_text: Option<String>,
     pub recommendation_text: Option<String>,
     pub severity_id: Option<String>,
     pub severity_name: Option<String>,
@@ -347,6 +353,9 @@ pub(crate) fn elevate_finding(
             code,
             title,
             condition_text: Some(condition),
+            criteria_text: None,
+            cause_text: None,
+            effect_text: None,
             recommendation_text: Some(recommendation),
             severity_id: Some(severity_id),
             severity_name,
@@ -391,7 +400,8 @@ pub(crate) fn list_findings(
 
         let mut stmt = conn.prepare(
             "SELECT f.id, f.engagement_id, f.code, f.title,
-                    f.condition_text, f.recommendation_text,
+                    f.condition_text, f.criteria_text, f.cause_text,
+                    f.effect_text, f.recommendation_text,
                     f.severity_id, fs.name, f.status,
                     f.test_id, t.code,
                     f.engagement_control_id, ec.code,
@@ -412,16 +422,19 @@ pub(crate) fn list_findings(
                     code: row.get(2)?,
                     title: row.get(3)?,
                     condition_text: row.get(4)?,
-                    recommendation_text: row.get(5)?,
-                    severity_id: row.get(6)?,
-                    severity_name: row.get(7)?,
-                    status: row.get(8)?,
-                    test_id: row.get(9)?,
-                    test_code: row.get(10)?,
-                    engagement_control_id: row.get(11)?,
-                    control_code: row.get(12)?,
-                    identified_at: row.get(13)?,
-                    identified_by_name: row.get(14)?,
+                    criteria_text: row.get(5)?,
+                    cause_text: row.get(6)?,
+                    effect_text: row.get(7)?,
+                    recommendation_text: row.get(8)?,
+                    severity_id: row.get(9)?,
+                    severity_name: row.get(10)?,
+                    status: row.get(11)?,
+                    test_id: row.get(12)?,
+                    test_code: row.get(13)?,
+                    engagement_control_id: row.get(14)?,
+                    control_code: row.get(15)?,
+                    identified_at: row.get(16)?,
+                    identified_by_name: row.get(17)?,
                     linked_test_result_ids: Vec::new(),
                 })
             })?
@@ -492,6 +505,18 @@ pub(crate) fn update_finding(
         .condition_text
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let criteria = input
+        .criteria_text
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let cause = input
+        .cause_text
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let effect = input
+        .effect_text
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let recommendation = input
         .recommendation_text
         .map(|s| s.trim().to_string())
@@ -504,6 +529,7 @@ pub(crate) fn update_finding(
         let existing = tx
             .query_row(
                 "SELECT f.engagement_id, f.code, f.title, f.condition_text,
+                        f.criteria_text, f.cause_text, f.effect_text,
                         f.recommendation_text, f.severity_id, f.status,
                         f.test_id, t.code, f.engagement_control_id, ec.code,
                         f.identified_at, f.identified_by, c.firm_id
@@ -520,16 +546,19 @@ pub(crate) fn update_finding(
                         code: r.get(1)?,
                         title: r.get(2)?,
                         condition: r.get(3)?,
-                        recommendation: r.get(4)?,
-                        severity_id: r.get(5)?,
-                        status: r.get(6)?,
-                        test_id: r.get(7)?,
-                        test_code: r.get(8)?,
-                        engagement_control_id: r.get(9)?,
-                        control_code: r.get(10)?,
-                        identified_at: r.get(11)?,
-                        identified_by: r.get(12)?,
-                        firm_id: r.get(13)?,
+                        criteria: r.get(4)?,
+                        cause: r.get(5)?,
+                        effect: r.get(6)?,
+                        recommendation: r.get(7)?,
+                        severity_id: r.get(8)?,
+                        status: r.get(9)?,
+                        test_id: r.get(10)?,
+                        test_code: r.get(11)?,
+                        engagement_control_id: r.get(12)?,
+                        control_code: r.get(13)?,
+                        identified_at: r.get(14)?,
+                        identified_by: r.get(15)?,
+                        firm_id: r.get(16)?,
                     })
                 },
             )
@@ -561,6 +590,21 @@ pub(crate) fn update_finding(
                 "condition_text",
                 existing.condition.clone(),
                 condition.clone(),
+            ),
+            (
+                "criteria_text",
+                existing.criteria.clone(),
+                criteria.clone(),
+            ),
+            (
+                "cause_text",
+                existing.cause.clone(),
+                cause.clone(),
+            ),
+            (
+                "effect_text",
+                existing.effect.clone(),
+                effect.clone(),
             ),
             (
                 "recommendation_text",
@@ -606,6 +650,9 @@ pub(crate) fn update_finding(
                 code: existing.code,
                 title: existing.title,
                 condition_text: existing.condition,
+                criteria_text: existing.criteria,
+                cause_text: existing.cause,
+                effect_text: existing.effect,
                 recommendation_text: existing.recommendation,
                 severity_id: existing.severity_id,
                 severity_name: Some(severity_name),
@@ -622,9 +669,24 @@ pub(crate) fn update_finding(
 
         tx.execute(
             "UPDATE Finding
-             SET title = ?1, condition_text = ?2, recommendation_text = ?3, severity_id = ?4
-             WHERE id = ?5",
-            params![title, condition, recommendation, severity_id, finding_id],
+             SET title = ?1,
+                 condition_text = ?2,
+                 criteria_text = ?3,
+                 cause_text = ?4,
+                 effect_text = ?5,
+                 recommendation_text = ?6,
+                 severity_id = ?7
+             WHERE id = ?8",
+            params![
+                title,
+                condition,
+                criteria,
+                cause,
+                effect,
+                recommendation,
+                severity_id,
+                finding_id,
+            ],
         )?;
 
         let sync_id: String = match tx
@@ -712,6 +774,9 @@ pub(crate) fn update_finding(
             code: existing.code,
             title,
             condition_text: condition,
+            criteria_text: criteria,
+            cause_text: cause,
+            effect_text: effect,
             recommendation_text: recommendation,
             severity_id: Some(severity_id),
             severity_name: Some(severity_name),
@@ -732,6 +797,9 @@ struct ExistingFinding {
     code: String,
     title: String,
     condition: Option<String>,
+    criteria: Option<String>,
+    cause: Option<String>,
+    effect: Option<String>,
     recommendation: Option<String>,
     severity_id: Option<String>,
     status: String,
@@ -1167,6 +1235,15 @@ mod tests {
                 condition_text: Some(
                     "Two terminated employees still had enabled AD accounts 30 days after departure.".into(),
                 ),
+                criteria_text: Some(
+                    "Firm-wide joiner/leaver policy requires accounts disabled within 24 hours of termination.".into(),
+                ),
+                cause_text: Some(
+                    "HR termination notifications are emailed ad-hoc rather than routed through a ticketed workflow, so IT missed two leavers.".into(),
+                ),
+                effect_text: Some(
+                    "Terminated staff retain the ability to authenticate, increasing risk of unauthorised access to client systems.".into(),
+                ),
                 recommendation_text: Some(
                     "Disable the identified accounts within 24 hours and re-run the matcher.".into(),
                 ),
@@ -1179,6 +1256,9 @@ mod tests {
         assert_eq!(updated.severity_id.as_deref(), Some("sev-high"));
         assert_eq!(updated.severity_name.as_deref(), Some("High"));
         assert!(updated.recommendation_text.as_deref().unwrap().contains("24 hours"));
+        assert!(updated.criteria_text.as_deref().unwrap().contains("policy"));
+        assert!(updated.cause_text.as_deref().unwrap().contains("HR termination"));
+        assert!(updated.effect_text.as_deref().unwrap().contains("unauthorised"));
 
         db.with(|conn| {
             let sync_id: String = conn.query_row(
@@ -1199,9 +1279,10 @@ mod tests {
                 params![sync_id],
                 |r| r.get(0),
             )?;
-            // One whole-row entry from elevation (field_name='.') + four
-            // field-level entries from this update.
-            assert_eq!(changes, 5);
+            // One whole-row entry from elevation (field_name='.') + seven
+            // field-level entries from this update (title, condition, criteria,
+            // cause, effect, recommendation, severity).
+            assert_eq!(changes, 8);
 
             let activity: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM ActivityLog
@@ -1243,6 +1324,9 @@ mod tests {
                 finding_id: finding.id.clone(),
                 title: finding.title.clone(),
                 condition_text: finding.condition_text.clone(),
+                criteria_text: finding.criteria_text.clone(),
+                cause_text: finding.cause_text.clone(),
+                effect_text: finding.effect_text.clone(),
                 recommendation_text: finding.recommendation_text.clone(),
                 severity_id: finding.severity_id.clone().unwrap(),
             },
@@ -1298,6 +1382,9 @@ mod tests {
                 finding_id: finding.id,
                 title: "hijack".into(),
                 condition_text: None,
+                criteria_text: None,
+                cause_text: None,
+                effect_text: None,
                 recommendation_text: None,
                 severity_id: "sev-high".into(),
             },
@@ -1332,6 +1419,9 @@ mod tests {
                 finding_id: finding.id,
                 title: finding.title,
                 condition_text: finding.condition_text,
+                criteria_text: finding.criteria_text,
+                cause_text: finding.cause_text,
+                effect_text: finding.effect_text,
                 recommendation_text: finding.recommendation_text,
                 severity_id: "sev-bogus".into(),
             },
@@ -1352,12 +1442,64 @@ mod tests {
                 finding_id: "does-not-exist".into(),
                 title: "ignored".into(),
                 condition_text: None,
+                criteria_text: None,
+                cause_text: None,
+                effect_text: None,
                 recommendation_text: None,
                 severity_id: "sev-medium".into(),
             },
         )
         .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)));
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn update_finding_persists_cccer_fields() {
+        let (db, db_path) = seeded_db("firm-f11", "user-f11", "client-f11", "eng-f11");
+        let auth = session_for("firm-f11", "user-f11");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+        let result_id = seed_with_exception(&db, &auth, &paths, "eng-f11");
+        let finding = elevate_finding(
+            &db,
+            &auth,
+            ElevateFindingInput {
+                test_result_id: result_id,
+                title: None,
+                severity_id: None,
+            },
+        )
+        .unwrap();
+
+        assert!(finding.criteria_text.is_none());
+        assert!(finding.cause_text.is_none());
+        assert!(finding.effect_text.is_none());
+
+        let updated = update_finding(
+            &db,
+            &auth,
+            UpdateFindingInput {
+                finding_id: finding.id.clone(),
+                title: finding.title.clone(),
+                condition_text: finding.condition_text.clone(),
+                criteria_text: Some("Joiner/leaver policy §4.2".into()),
+                cause_text: Some("Manual HR notification process".into()),
+                effect_text: Some("Unauthorised access risk".into()),
+                recommendation_text: finding.recommendation_text.clone(),
+                severity_id: finding.severity_id.clone().unwrap(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(updated.criteria_text.as_deref(), Some("Joiner/leaver policy §4.2"));
+        assert_eq!(updated.cause_text.as_deref(), Some("Manual HR notification process"));
+        assert_eq!(updated.effect_text.as_deref(), Some("Unauthorised access risk"));
+
+        let reloaded = list_findings(&db, &auth, "eng-f11".into()).unwrap();
+        assert_eq!(reloaded[0].criteria_text.as_deref(), Some("Joiner/leaver policy §4.2"));
+        assert_eq!(reloaded[0].cause_text.as_deref(), Some("Manual HR notification process"));
+        assert_eq!(reloaded[0].effect_text.as_deref(), Some("Unauthorised access risk"));
         cleanup(&db_path);
     }
 }

@@ -8,7 +8,7 @@ Entries are reverse-chronological. Most recent first.
 
 ## Current state
 
-**Phase**: First real vertical slice live — User Access Review (Module 6/7/8 ribbon) — plus Evidence (Module 7) browsable chain of custody. From an engagement detail page an auditor can add a library control (clones risks + tests into the engagement), upload an AD export and an HR leavers list as encrypted `DataImport`s, run a rule-based matcher — `UAM-T-001` (terminated-but-active) or `UAM-T-003` (dormant accounts) — to produce a `TestResult`, elevate exceptions to a draft `Finding` with severity, and see every raw upload, matcher report, and free-form attachment in an Evidence table with source, test linkage, and one-click download. All mutations are attributable (SyncRecord + ChangeLog + ActivityLog + EvidenceProvenance) and cross-firm isolated.
+**Phase**: First real vertical slice live — User Access Review (Module 6/7/8 ribbon) — plus Evidence (Module 7) browsable chain of custody and a per-test Working Paper view with CCCER-shaped finding editing. From an engagement detail page an auditor can add a library control (clones risks + tests into the engagement), upload an AD export and an HR leavers list as encrypted `DataImport`s, run a rule-based matcher — `UAM-T-001` (terminated-but-active) or `UAM-T-003` (dormant accounts) — to produce a `TestResult`, elevate exceptions to a draft `Finding` with severity, drill into the test's Working Paper to see control context + run history + findings (condition / criteria / cause / effect / recommendation) + test-scoped evidence, and browse every raw upload, matcher report, and free-form attachment in the engagement-level Evidence table. All mutations are attributable (SyncRecord + ChangeLog + ActivityLog + EvidenceProvenance) and cross-firm isolated.
 
 Earlier foundations remain: authentication + encrypted DB, Ed25519-verified library baseline (now v0.1.0 + v0.2.0), Clients / Engagements CRUD, and the Library browse route.
 
@@ -41,8 +41,8 @@ Earlier foundations remain: authentication + encrypted DB, Ed25519-verified libr
 **Immediate next up**:
 
 1. **More rule matchers** — change-management (`CHG-T-001`) and backup (`BKP-T-001`) are the next two to ship. Same dispatcher-through-rule-variant pattern as the two UAR rules. Orphan-accounts (AD rows with no matching HR master) is the other natural UAR extension.
-2. **CCCER-shaped finding editor** — split the flat condition/recommendation fields into condition / criteria / cause / effect / recommendation. The Finding table and `update_finding` command already carry enough data; this is a UI + model extension.
-3. **Working paper view** — one card per test, sidebar navigation grouping by control, review-note-as-margin-annotation pattern.
+2. **Review-note annotations on the working paper** — inline margin notes on a test that reviewers can tick to clear, preserving the audit trail. Working Paper route is in place; this adds the review layer on top.
+3. **Attach-evidence-to-finding UI** — `finding_attach_evidence` / `finding_detach_evidence` are wired and tested; surface them from the CCCER editor so auditors can cite specific evidence per finding without leaving the working paper.
 4. **Schema cleanup** — drop `User.argon2_hash` and `User.master_key_wrapped` (future migration). Authoritative copies live in `identity.json`.
 5. **Password change UI** — the `change_password` command is already registered; Settings needs a form that calls it.
 6. **Zeroise master key in memory** — add `ZeroizeOnDrop` to the MK buffer before it reaches SQLCipher. Defensive; not a known leak.
@@ -56,6 +56,109 @@ Earlier foundations remain: authentication + encrypted DB, Ed25519-verified libr
 ---
 
 ## Decision log
+
+### 2026-04-24 — Working Paper view + CCCER finding editor
+
+Auditors spend their day inside a single test. EngagementDetail gave a bird's-eye
+view across all controls and tests; it didn't give the focused surface where
+judgment actually happens. The Working Paper route fixes that — it opens one
+test at a time with its control context, objective, run history as a timeline,
+CCCER-rendered findings, and test-scoped evidence. The CCCER split (Condition,
+Criteria, Cause, Effect, Recommendation) replaces the MVP's flat condition /
+recommendation pair.
+
+**Migration 0010** (`app/src-tauri/src/db/migrations/0010_cccer_finding_fields.sql`):
+- Three `ALTER TABLE Finding ADD COLUMN` statements for `criteria_text`,
+  `cause_text`, `effect_text`. All nullable. Existing draft findings remain
+  valid — the three new columns start NULL and pick up content the first time
+  an auditor opens the finding in the CCCER editor.
+- No data backfill. The original `condition_text` and `recommendation_text`
+  still come from the matcher-generated elevation boilerplate; CCCER adds the
+  three judgmental pieces on top rather than replacing them.
+
+**Rust (`app/src-tauri/src/commands/findings.rs`)**:
+- `UpdateFindingInput` and `FindingSummary` gained `criteria_text`, `cause_text`,
+  `effect_text` alongside the existing fields. `elevate_finding` sets them to
+  `None` on creation (matchers can't infer these honestly; the auditor decides).
+- `update_finding`'s change detector now diffs seven fields instead of four;
+  ChangeLog records one row per changed field, and an edit of all three new
+  fields plus the two old ones produces six field-level entries on top of the
+  elevation's whole-row entry.
+- `list_findings` SELECT and row mapping updated to project all three new
+  columns. Schema-adjacent callers (`ExistingFinding`) track them identically.
+
+**Router / routes** (`app/src/lib/stores/router.ts`, `app/src/App.svelte`):
+- Added `"working-paper"` to `RouteId`, added `currentTestId` writable, and
+  added `openWorkingPaper(engagementId, testId)` helper. Single slot per
+  detail view — same pattern as `currentEngagementId`. No URL routing; Tauri
+  has no address bar to reconcile with.
+- `App.svelte` picks up a new branch that renders `WorkingPaper.svelte` when
+  the route is `"working-paper"`.
+
+**New route (`app/src/lib/routes/WorkingPaper.svelte`)**:
+- Loads the engagement's tests, results, findings, severities, and evidence
+  via the existing list commands in parallel, then filters client-side to
+  `currentTestId`. No new backend aggregate command — keeps the surface
+  small; an aggregate can land later if the engagement-wide lists grow
+  expensive.
+- Sections: Control context card, Test card (objective + metadata + matcher
+  button if rule-based), Results timeline (newest first, first item accent-
+  coloured), Findings rendered as CCCER `<dl>` cards with "Not yet recorded"
+  placeholders on empty criteria/cause/effect, and Evidence table scoped to
+  this test (matches `Evidence.test_id` OR `TestEvidenceLink.test_id`).
+- Evidence upload form pre-fills `test_id`, so uploads from inside a working
+  paper bind to the current test automatically.
+
+**Shared editor (`app/src/lib/components/FindingEditor.svelte`)**:
+- Pulled the CCCER form into a component so EngagementDetail and WorkingPaper
+  share one editor. Props: `finding`, `severities`, `onSaved`, `onCancel`.
+  Callers mount a fresh instance per finding (keyed on `editingFindingId`),
+  so the `$state(untrack(() => finding.x))` pattern seeds initial values from
+  props without re-binding on prop updates.
+- Hint text under each textarea names what auditors should write (criteria =
+  standard / policy / control objective; cause = root cause, not symptom;
+  effect = concrete exposure). Aim is to guide without blocking.
+
+**EngagementDetail rewiring**:
+- Tests table gained an "Open" link per row that calls
+  `openWorkingPaper(engagement.id, t.id)`. "Run matcher" stays on the row for
+  rule-based tests so the table still works as a quick-run surface.
+- Findings table swapped its inline 2-field edit form for the shared
+  `FindingEditor`, so editing from either surface produces the same CCCER
+  structure. The Findings table's Edit action now sits next to an "Open" link
+  that jumps to the related test's working paper (when the finding is tied to
+  a test).
+
+**TypeScript (`app/src/lib/api/tauri.ts`)**:
+- `FindingSummary` and `UpdateFindingInput` both gained `criteria_text`,
+  `cause_text`, `effect_text`.
+
+**Verified**:
+- `cargo test --lib` — 73 tests pass (one new: `update_finding_persists_cccer_fields`).
+  Previously passing tests that construct `UpdateFindingInput` were updated
+  to supply the three new fields as `None`.
+- `npm run check` — 0 errors, 0 warnings across 94 files.
+- `npm run build` — clean vite build.
+
+**Deliberately deferred**:
+- Attach-evidence-to-finding UI. The backend commands are wired and tested,
+  but the CCCER editor doesn't surface an evidence picker yet — that lands
+  next so we can design the picker against the new CCCER layout rather than
+  retrofit it.
+- Review-note annotations on the working paper. The route is the surface
+  that will host them; the inline-margin review-note pattern is its own
+  design problem.
+- Per-test aggregate backend command. Today the working paper reloads all
+  engagement-wide lists and filters client-side — cheap while engagements
+  stay small. Revisit if a single engagement grows beyond a few hundred
+  tests / results.
+
+**Files of note**: `app/src-tauri/src/db/migrations/0010_cccer_finding_fields.sql`,
+`app/src-tauri/src/db/migrations/mod.rs`, `app/src-tauri/src/commands/findings.rs`,
+`app/src/lib/stores/router.ts`, `app/src/App.svelte`,
+`app/src/lib/components/FindingEditor.svelte`,
+`app/src/lib/routes/WorkingPaper.svelte`, `app/src/lib/routes/EngagementDetail.svelte`,
+`app/src/lib/api/tauri.ts`.
 
 ### 2026-04-24 — Evidence module (Module 7, minimal subset)
 
