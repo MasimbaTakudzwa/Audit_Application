@@ -2,7 +2,7 @@
 
 First-pass schema for the foundation and core-domain modules. Expressed in SQLite-flavoured SQL-ish notation since the storage layer is SQLCipher-encrypted SQLite. Types shown as `TEXT`, `INTEGER`, `BLOB`, `REAL`. Booleans are stored as `INTEGER 0/1`. Timestamps are Unix epoch seconds (UTC).
 
-This file covers **Modules 1, 2, 3, 4, 5, 12**. Modules 6–11 and 13 will be added as their designs firm up (see `PROGRESS.md`).
+This file covers **Modules 1, 2, 3, 4, 5, 6, 7, 8, 9, 12**. Modules 10, 11, 13 will be added as their designs firm up (see `PROGRESS.md`).
 
 For module rationale and relationships see `MODULES.md`. For longer-form decision rationale see `NOTES.md`.
 
@@ -396,6 +396,437 @@ FirmOverride
 
 ---
 
+## Module 6 — Fieldwork & Testing
+
+Engagement-level clones of library methodology plus the machinery for executing tests: samples, results, imports, connectors.
+
+```
+EngagementRisk
+  id                           TEXT PK
+  engagement_id                TEXT FK → Engagement.id
+  derived_from                 TEXT FK → LibraryRisk.id      -- null if hand-authored
+  source_library_version       TEXT                           -- null if hand-authored
+  prior_engagement_risk_id     TEXT FK → EngagementRisk.id   -- carry-forward lineage
+  code                         TEXT NOT NULL                  -- copied from library; editable
+  title                        TEXT NOT NULL
+  description                  TEXT NOT NULL
+  inherent_rating              TEXT NOT NULL                  -- high | medium | low
+  residual_rating              TEXT                           -- set after testing
+  applicable_system_ids_json   TEXT                           -- [System.id, ...] — scoping within engagement
+  notes_blob_id                TEXT FK → EncryptedBlob.id
+  created_by                   TEXT FK → User.id
+  created_at                   INTEGER NOT NULL
+  UNIQUE (engagement_id, code)
+  INDEX (engagement_id)
+
+EngagementControl
+  id                           TEXT PK
+  engagement_id                TEXT FK → Engagement.id
+  derived_from                 TEXT FK → LibraryControl.id
+  source_library_version       TEXT
+  prior_engagement_control_id  TEXT FK → EngagementControl.id
+  code                         TEXT NOT NULL
+  title                        TEXT NOT NULL
+  description                  TEXT NOT NULL
+  objective                    TEXT NOT NULL
+  control_type                 TEXT NOT NULL                  -- preventive | detective | corrective
+  frequency                    TEXT
+  design_assessment            TEXT                           -- designed_effective | designed_deficient | not_assessed
+  operating_assessment         TEXT                           -- effective | deficient | not_tested
+  related_engagement_risk_ids_json TEXT
+  applicable_system_ids_json   TEXT
+  notes_blob_id                TEXT FK → EncryptedBlob.id
+  created_by                   TEXT FK → User.id
+  created_at                   INTEGER NOT NULL
+  UNIQUE (engagement_id, code)
+  INDEX (engagement_id)
+
+Test
+  id                           TEXT PK
+  engagement_id                TEXT FK → Engagement.id
+  engagement_control_id        TEXT FK → EngagementControl.id
+  system_id                    TEXT FK → System.id           -- which system this instance targets
+  derived_from                 TEXT FK → TestProcedure.id
+  source_library_version       TEXT
+  prior_test_id                TEXT FK → Test.id             -- prior engagement's same test
+  code                         TEXT NOT NULL
+  name                         TEXT NOT NULL
+  objective                    TEXT NOT NULL
+  steps_json                   TEXT NOT NULL                  -- copy of procedure steps, editable per-engagement
+  automation_tier              TEXT NOT NULL                  -- rule_based | classical_ml | local_llm | hosted_llm | manual
+  assigned_to                  TEXT FK → User.id
+  status                       TEXT NOT NULL                  -- not_started | in_progress | blocked | complete
+  planned_start_date           TEXT                           -- ISO 8601
+  planned_end_date             TEXT
+  actual_started_at            INTEGER
+  actual_completed_at          INTEGER
+  notes_blob_id                TEXT FK → EncryptedBlob.id
+  created_by                   TEXT FK → User.id
+  created_at                   INTEGER NOT NULL
+  UNIQUE (engagement_id, code, system_id)
+  INDEX (engagement_id, status)
+  INDEX (engagement_control_id)
+
+SamplingPlan
+  id                           TEXT PK
+  test_id                      TEXT FK → Test.id
+  method                       TEXT NOT NULL                  -- full_population | statistical_mus | statistical_attribute | judgemental
+  population_size              INTEGER NOT NULL
+  sample_size                  INTEGER NOT NULL
+  confidence_level             REAL                           -- e.g. 0.95
+  tolerable_rate               REAL                           -- attribute sampling
+  expected_error_rate          REAL
+  materiality                  REAL                           -- MUS
+  seed                         INTEGER NOT NULL               -- recorded for reviewer reproducibility
+  parameters_json              TEXT                           -- method-specific overflow (strata, interval, etc.)
+  drawn_by                     TEXT FK → User.id
+  drawn_at                     INTEGER NOT NULL
+  INDEX (test_id)
+
+Sample
+  id                           TEXT PK
+  sampling_plan_id             TEXT FK → SamplingPlan.id
+  test_id                      TEXT FK → Test.id              -- redundant but enables direct lookup
+  ordinal                      INTEGER NOT NULL               -- 1-based within the plan
+  population_ref               TEXT NOT NULL                  -- opaque ref into source population (e.g. employee_id)
+  population_ref_label         TEXT                           -- human-readable summary
+  selection_reason             TEXT                           -- "random" | "judgemental_high_risk" | ...
+  UNIQUE (sampling_plan_id, ordinal)
+  INDEX (test_id)
+
+TestResult
+  id                           TEXT PK
+  test_id                      TEXT FK → Test.id
+  sample_id                    TEXT FK → Sample.id            -- null for population-wide or design-only tests
+  outcome                      TEXT NOT NULL                  -- pass | exception | not_applicable | could_not_test
+  exception_summary            TEXT                           -- one-line; full detail lives on Finding if elevated
+  evidence_count               INTEGER NOT NULL DEFAULT 0
+  performed_by                 TEXT FK → User.id
+  performed_at                 INTEGER NOT NULL
+  notes_blob_id                TEXT FK → EncryptedBlob.id
+  INDEX (test_id)
+  INDEX (test_id, outcome)
+
+TestConclusion
+  id                           TEXT PK
+  test_id                      TEXT FK → Test.id UNIQUE       -- one conclusion per test
+  conclusion                   TEXT NOT NULL                  -- effective | deficient | compensating_control_relied_on | inconclusive
+  rationale_blob_id            TEXT FK → EncryptedBlob.id
+  exception_count              INTEGER NOT NULL
+  projected_error_rate         REAL                           -- populated for statistical sampling
+  reached_by                   TEXT FK → User.id
+  reached_at                   INTEGER NOT NULL
+
+Connector
+  id                           TEXT PK
+  engagement_id                TEXT FK → Engagement.id
+  system_id                    TEXT FK → System.id
+  kind                         TEXT NOT NULL                  -- ldap | sap_rfc | sql_readonly | sftp | rest_api | csv_inbox
+  status                       TEXT NOT NULL                  -- configured | connected | error | disabled
+  config_json                  TEXT NOT NULL                  -- host, port, bind DN, etc. (secrets in keychain)
+  keychain_entry_id            TEXT FK → KeychainEntry.id
+  last_connected_at            INTEGER
+  last_error                   TEXT
+  created_by                   TEXT FK → User.id
+  created_at                   INTEGER NOT NULL
+  INDEX (engagement_id)
+
+DataImport
+  id                           TEXT PK
+  engagement_id                TEXT FK → Engagement.id
+  system_id                    TEXT FK → System.id            -- nullable for cross-system imports
+  connector_id                 TEXT FK → Connector.id         -- nullable for manual uploads
+  source_kind                  TEXT NOT NULL                  -- csv_upload | excel_upload | ldap_query | sap_export | sql_query | pdf_ocr
+  filename                     TEXT                           -- for file uploads
+  blob_id                      TEXT FK → EncryptedBlob.id     -- raw import payload
+  row_count                    INTEGER
+  sha256_plaintext             TEXT NOT NULL                  -- matches blob hash; tamper-evident
+  schema_json                  TEXT                           -- detected column names + types
+  purpose_tag                  TEXT                           -- "ad_user_export" | "hr_leavers" | "journal_entries" — semantic marker
+  imported_by                  TEXT FK → User.id
+  imported_at                  INTEGER NOT NULL
+  INDEX (engagement_id)
+  INDEX (engagement_id, purpose_tag)
+```
+
+**Notes:**
+- Engagement-level clones (`EngagementRisk`, `EngagementControl`, `Test`) carry both `derived_from` (library lineage) and `prior_engagement_*_id` (carry-forward lineage). Walking either chain answers "where did this come from?" without ambiguity.
+- One `EngagementControl` can have multiple `Test` rows — one per system in scope. The `UNIQUE (engagement_id, code, system_id)` constraint enforces one test per control-per-system.
+- `TestResult.sample_id` is nullable so a population-wide or design-only test records a single result without a synthetic sample.
+- `SamplingPlan.seed` is required — the reviewer must be able to reproduce exactly the same selection.
+- `Connector.keychain_entry_id` keeps connection secrets out of the DB. Same pattern as the user master key.
+- `DataImport.purpose_tag` is the semantic handle matchers use ("grab the `ad_user_export` and the `hr_leavers` from this engagement"). Loose enum by design — firms can add their own tags.
+
+---
+
+## Module 7 — Evidence Management
+
+Everything that backs up a test. Covers PBC (provided-by-client) request lifecycle, chain-of-custody, and cross-year evidence linking.
+
+```
+Evidence
+  id                           TEXT PK
+  engagement_id                TEXT FK → Engagement.id
+  test_id                      TEXT FK → Test.id              -- primary linked test
+  test_result_id               TEXT FK → TestResult.id        -- null unless tied to a specific sample
+  blob_id                      TEXT FK → EncryptedBlob.id
+  data_import_id               TEXT FK → DataImport.id        -- set when evidence is a slice of a bulk import
+  title                        TEXT NOT NULL
+  description                  TEXT
+  source                       TEXT NOT NULL                  -- client_upload | auditor_extract | connector | prior_year_link | generated
+  obtained_at                  INTEGER NOT NULL
+  obtained_from                TEXT                           -- contact name or system reference
+  pbc_request_id               TEXT FK → PBCRequest.id        -- null if not PBC-driven
+  INDEX (engagement_id)
+  INDEX (test_id)
+
+TestEvidenceLink
+  id                           TEXT PK
+  test_id                      TEXT FK → Test.id
+  evidence_id                  TEXT FK → Evidence.id
+  relevance                    TEXT                           -- primary | supporting | cross_reference
+  created_at                   INTEGER NOT NULL
+  UNIQUE (test_id, evidence_id)
+  INDEX (evidence_id)
+
+EvidenceTag
+  id                           TEXT PK
+  evidence_id                  TEXT FK → Evidence.id
+  tag                          TEXT NOT NULL                  -- "user_listing" | "change_ticket" | "backup_log" | firm-defined
+  INDEX (evidence_id)
+  INDEX (tag)
+
+EvidenceProvenance
+  id                           TEXT PK
+  evidence_id                  TEXT FK → Evidence.id
+  chain_ordinal                INTEGER NOT NULL               -- 1 = origin; increments on each transformation
+  action                       TEXT NOT NULL                  -- uploaded | ocrd | extracted | redacted | prior_year_linked
+  actor_type                   TEXT NOT NULL                  -- user | system | portal_user
+  actor_id                     TEXT                           -- User.id / PortalUser.id / tool name
+  occurred_at                  INTEGER NOT NULL
+  detail_json                  TEXT                           -- tool version, source ref, etc.
+  UNIQUE (evidence_id, chain_ordinal)
+
+PBCRequest
+  id                           TEXT PK
+  engagement_id                TEXT FK → Engagement.id
+  test_id                      TEXT FK → Test.id              -- nullable for engagement-level requests
+  title                        TEXT NOT NULL
+  description_blob_id          TEXT FK → EncryptedBlob.id
+  requested_from_contact_id    TEXT FK → ClientContact.id
+  status                       TEXT NOT NULL                  -- draft | sent | partially_received | received | overdue | cancelled
+  due_date                     TEXT                           -- ISO 8601
+  sent_at                      INTEGER
+  received_at                  INTEGER
+  created_by                   TEXT FK → User.id
+  created_at                   INTEGER NOT NULL
+  INDEX (engagement_id, status)
+
+PBCStatus
+  id                           TEXT PK
+  pbc_request_id               TEXT FK → PBCRequest.id
+  status                       TEXT NOT NULL
+  changed_at                   INTEGER NOT NULL
+  actor_type                   TEXT NOT NULL                  -- user | portal_user | system
+  actor_id                     TEXT                           -- resolved via actor_type
+  note                         TEXT
+  INDEX (pbc_request_id, changed_at)
+
+PriorYearEvidenceLink
+  id                           TEXT PK
+  current_engagement_id        TEXT FK → Engagement.id
+  current_test_id              TEXT FK → Test.id
+  prior_evidence_id            TEXT FK → Evidence.id
+  attestation_blob_id          TEXT FK → EncryptedBlob.id     -- "unchanged from prior year" rationale
+  attested_by                  TEXT FK → User.id
+  attested_at                  INTEGER NOT NULL
+  INDEX (current_test_id)
+```
+
+**Notes:**
+- `Evidence.test_id` is the **primary** linkage. Use `TestEvidenceLink` for additional associations (one file backing multiple tests). Exactly one primary per evidence item; many secondary.
+- `EvidenceProvenance` is append-only chain-of-custody. Client evidence often passes through OCR, extraction, or manual slicing before it lands on a test — the provenance chain makes each transformation visible.
+- `PBCStatus` keeps the lifecycle history (when did it move from `sent` to `partially_received`?). Separate from `ActivityLog` because it drives the reminder / overdue UI and the client portal's request dashboard.
+- `PriorYearEvidenceLink.attestation_blob_id` holds the auditor's written rationale for why prior-year evidence is still sufficient. Required per the "fresh upload preferred" decision.
+
+---
+
+## Module 8 — Findings & Remediation
+
+Control deficiencies in CCCER form (Condition / Criteria / Cause / Effect / Recommendation), the management response, and year-over-year recurrence tracking.
+
+```
+Finding
+  id                           TEXT PK
+  engagement_id                TEXT FK → Engagement.id
+  test_id                      TEXT FK → Test.id              -- origin test
+  engagement_control_id        TEXT FK → EngagementControl.id -- control the finding is against
+  code                         TEXT NOT NULL                  -- "F-<eng-short>-NNN"
+  title                        TEXT NOT NULL
+  condition_blob_id            TEXT FK → EncryptedBlob.id     -- "what we observed"
+  criteria_blob_id             TEXT FK → EncryptedBlob.id     -- "what should have happened"
+  cause_blob_id                TEXT FK → EncryptedBlob.id     -- "why it happened"
+  effect_blob_id               TEXT FK → EncryptedBlob.id     -- "impact / risk"
+  recommendation_blob_id       TEXT FK → EncryptedBlob.id
+  severity_id                  TEXT FK → FindingSeverity.id
+  root_cause_id                TEXT FK → RootCauseTaxonomy.id
+  status                       TEXT NOT NULL                  -- draft | open | management_accepted | in_remediation | remediated | closed | disputed
+  identified_by                TEXT FK → User.id
+  identified_at                INTEGER NOT NULL
+  first_communicated_at        INTEGER
+  closed_at                    INTEGER
+  UNIQUE (engagement_id, code)
+  INDEX (engagement_id, status)
+  INDEX (engagement_control_id)
+
+FindingTestResultLink
+  id                           TEXT PK
+  finding_id                   TEXT FK → Finding.id
+  test_result_id               TEXT FK → TestResult.id
+  UNIQUE (finding_id, test_result_id)
+  INDEX (test_result_id)
+
+FindingSeverity
+  id                           TEXT PK
+  name                         TEXT NOT NULL                  -- critical | high | medium | low | observation
+  sort_order                   INTEGER NOT NULL
+  description                  TEXT
+  is_builtin                   INTEGER NOT NULL
+
+RootCauseTaxonomy
+  id                           TEXT PK
+  firm_id                      TEXT FK → Firm.id              -- null for built-in taxonomy
+  code                         TEXT NOT NULL                  -- "RC-ACC-01"
+  name                         TEXT NOT NULL                  -- "Inadequate user access review"
+  category                     TEXT NOT NULL                  -- people | process | technology | governance
+  description                  TEXT
+  parent_id                    TEXT FK → RootCauseTaxonomy.id -- hierarchical
+  is_builtin                   INTEGER NOT NULL
+  INDEX (firm_id, parent_id)
+
+ManagementActionPlan
+  id                           TEXT PK
+  finding_id                   TEXT FK → Finding.id UNIQUE    -- one MAP per finding
+  response_type                TEXT NOT NULL                  -- accept | mitigate | transfer | dispute
+  response_blob_id             TEXT FK → EncryptedBlob.id     -- management's written response
+  action_plan_blob_id          TEXT FK → EncryptedBlob.id     -- remediation steps
+  owner_contact_id             TEXT FK → ClientContact.id
+  target_date                  TEXT                           -- ISO 8601
+  committed_at                 INTEGER                        -- management sign-off timestamp
+  status                       TEXT NOT NULL                  -- proposed | agreed | rejected | in_progress | completed | overdue
+
+FollowUp
+  id                           TEXT PK
+  finding_id                   TEXT FK → Finding.id
+  management_action_plan_id    TEXT FK → ManagementActionPlan.id
+  follow_up_date               TEXT NOT NULL                  -- ISO 8601
+  performed_by                 TEXT FK → User.id
+  performed_at                 INTEGER
+  verification_outcome         TEXT                           -- verified_complete | partially_complete | not_complete | superseded
+  evidence_id                  TEXT FK → Evidence.id          -- supporting evidence
+  notes_blob_id                TEXT FK → EncryptedBlob.id
+  INDEX (finding_id, follow_up_date)
+
+RecurringFindingLink
+  id                           TEXT PK
+  current_finding_id           TEXT FK → Finding.id
+  prior_finding_id             TEXT FK → Finding.id
+  match_type                   TEXT NOT NULL                  -- exact_control | same_root_cause | semantic
+  match_confidence             REAL                           -- 0..1 (exact = 1.0; semantic < 1.0)
+  identified_at                INTEGER NOT NULL
+  confirmed_by                 TEXT FK → User.id              -- auditor confirms auto-detected recurrence
+  confirmed_at                 INTEGER
+  INDEX (current_finding_id)
+  INDEX (prior_finding_id)
+```
+
+**Notes:**
+- CCCER blobs are held separately so each can be edited, reviewed, and LLM-drafted independently. Drafting cause vs recommendation are different prompts; keeping them split avoids re-prompting the whole finding.
+- `FindingTestResultLink` — one finding often aggregates many exception rows (e.g. "12 terminated users still active" = 12 `TestResult`s, one `Finding`). The join makes the aggregation explicit and queryable.
+- `ManagementActionPlan` is one-per-finding (UNIQUE). Many `FollowUp`s per plan.
+- `RecurringFindingLink.match_type`:
+  - `exact_control` — both findings chain back through `EngagementControl.derived_from` to the same library control. Pure rule-based, confidence 1.0.
+  - `same_root_cause` — both tagged with the same `RootCauseTaxonomy`. Rule-based.
+  - `semantic` — sentence-transformer similarity above a threshold. Auditor-confirmable suggestion; confidence carries through from the matcher.
+
+---
+
+## Module 9 — Working Papers & Review
+
+Structured review documents. Supports per-test, per-section, or custom grouping (the three-format decision in `MODULES.md`).
+
+```
+WorkingPaper
+  id                           TEXT PK
+  engagement_id                TEXT FK → Engagement.id
+  code                         TEXT NOT NULL                  -- "WP-<eng-short>-NNN"
+  title                        TEXT NOT NULL
+  wp_type                      TEXT NOT NULL                  -- per_test | per_section | custom
+  section                      TEXT                           -- grouping label (e.g. "Change Management")
+  status                       TEXT NOT NULL                  -- draft | prepared | in_review | reviewed | locked
+  prepared_by                  TEXT FK → User.id
+  prepared_at                  INTEGER
+  reviewed_by                  TEXT FK → User.id
+  reviewed_at                  INTEGER
+  locked_at                    INTEGER
+  content_blob_id              TEXT FK → EncryptedBlob.id     -- rendered narrative body (when not split into sections)
+  created_by                   TEXT FK → User.id
+  created_at                   INTEGER NOT NULL
+  UNIQUE (engagement_id, code)
+  INDEX (engagement_id, status)
+
+WPSection
+  id                           TEXT PK
+  working_paper_id             TEXT FK → WorkingPaper.id
+  ordinal                      INTEGER NOT NULL
+  heading                      TEXT NOT NULL                  -- "Objective" | "Procedures performed" | "Conclusion" | custom
+  body_blob_id                 TEXT FK → EncryptedBlob.id
+  UNIQUE (working_paper_id, ordinal)
+
+WPTestLink
+  id                           TEXT PK
+  working_paper_id             TEXT FK → WorkingPaper.id
+  test_id                      TEXT FK → Test.id
+  include_samples              INTEGER NOT NULL               -- 1 = pull sample detail into the render
+  include_results              INTEGER NOT NULL
+  include_exceptions           INTEGER NOT NULL
+  UNIQUE (working_paper_id, test_id)
+  INDEX (test_id)
+
+ReviewNote
+  id                           TEXT PK
+  working_paper_id             TEXT FK → WorkingPaper.id
+  anchor                       TEXT                           -- "section:<id>" | "sample:<id>" | "result:<id>" | "."
+  content_blob_id              TEXT FK → EncryptedBlob.id
+  raised_by                    TEXT FK → User.id
+  raised_at                    INTEGER NOT NULL
+  status                       TEXT NOT NULL                  -- open | addressed | cleared | retained_for_history
+  addressed_by                 TEXT FK → User.id
+  addressed_at                 INTEGER
+  cleared_by                   TEXT FK → User.id              -- reviewer who ticks the note off
+  cleared_at                   INTEGER
+  INDEX (working_paper_id, status)
+
+SignOff
+  id                           TEXT PK
+  working_paper_id             TEXT FK → WorkingPaper.id
+  user_id                      TEXT FK → User.id
+  role_at_signoff              TEXT NOT NULL                  -- preparer | reviewer | partner
+  action                       TEXT NOT NULL                  -- prepared | reviewed | partner_approved | reopened | locked
+  signed_at                    INTEGER NOT NULL
+  signature_blob_id            TEXT FK → EncryptedBlob.id     -- optional: captured signature image or PKI signature
+  notes                        TEXT
+  INDEX (working_paper_id, signed_at)
+```
+
+**Notes:**
+- `WorkingPaper.wp_type` is advisory for the UI, not a DB rule. A `per_test` WP *usually* has exactly one `WPTestLink`, but the schema does not enforce that — firms mix conventions and migrations should preserve existing structure.
+- `WPSection` is optional. Simple WPs use `WorkingPaper.content_blob_id` as a single body; structured WPs split into ordered sections, each with its own blob.
+- `ReviewNote.anchor` is a lightweight locator string the UI resolves to a specific point in the rendered WP. `retained_for_history` keeps the thread visible post-close even though it has been addressed — the audit trail is more valuable than the tidiness of a cleared screen.
+- `SignOff` is the immutable ledger of prepare → review → partner-approve → lock. Never deleted. A "reopen" creates a new `SignOff` row with `action=reopened`; the chain shows the full history.
+
+---
+
 ## Cross-cutting: ActivityLog
 
 Distinct from `ChangeLog`. `ChangeLog` is for sync replay and conflict detection (row-level, machine-oriented). `ActivityLog` is the audit-trail-for-humans — reviewer-facing, groupable by action, free-text annotations.
@@ -421,11 +852,14 @@ Append-only. No UPDATE or DELETE path exposed in the application layer.
 
 ## Open data-model questions
 
-- **UUID format**: UUID v7 preferred for index locality. Confirm library availability in chosen Rust crate when scaffolding.
-- **FK enforcement**: SQLite requires `PRAGMA foreign_keys = ON` per connection. Embed in connection wrapper.
-- **JSON validation**: SQLite has `json_valid()`; consider a CHECK constraint on every `_json` column, or validate at the ORM/application boundary.
-- **Full-text search**: FTS5 virtual tables for `Finding`, `WorkingPaper`, `Evidence` content search — deferred to Module 6–9 schemas.
-- **Library bundle format**: design the on-disk format (JSON? SQLite file? signed tarball?) that ships library updates between versions. Needed before first library-update test.
-- **Blob storage layout on disk**: directory structure per engagement, per blob type. Decide before first write so migrations don't bite.
+- **JSON validation**: SQLite has `json_valid()`; decide between a CHECK constraint on every `_json` column, or validation at the application boundary. Currently validated at the application boundary (serde round-trip); revisit if corruption becomes a real risk.
+- **Full-text search**: FTS5 virtual tables are the natural home for searching `Finding` (condition/criteria/cause/effect), `WorkingPaper.content`, `WPSection.body`, and `Evidence.description`. Blob content would need to be mirrored into the FTS table in plaintext — crosses the plaintext-at-rest line. Deferred until search demand surfaces; likely resolved by indexing an in-memory decrypt-on-query path instead.
+- **Blob storage layout on disk**: directory structure per engagement, per blob type. Decide before first write so migrations don't bite. Proposed: `{app_data_dir}/blobs/<engagement_id>/<first_two_chars_of_blob_id>/<blob_id>.bin`. Two-char fan-out keeps any single directory under a few thousand files.
+- **`ActivityLog` vs `ChangeLog` boundary**: reaffirmed — `ChangeLog` feeds sync/conflict and is row+field granular; `ActivityLog` is the human audit trail (coarser, with free-text summaries). When both would fire on the same mutation, both fire — overlap is the point.
+
+Resolved during Modules 6-9 drafting (2026-04-24):
+- **UUID format** — UUID v7 confirmed in use via `uuid` crate with `v7` feature.
+- **FK enforcement** — `PRAGMA foreign_keys = ON` is set in `db::open_with_key`.
+- **Library bundle format** — signed JSON + detached Ed25519 `.sig` file, shipped in-binary, verified on DB open. See `NOTES.md` and Module 5 notes.
 
 These are captured here (not in `PROGRESS.md`) because they're schema-level, not project-level.

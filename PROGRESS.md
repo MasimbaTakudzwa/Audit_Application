@@ -18,7 +18,7 @@ Entries are reverse-chronological. Most recent first.
 - `README.md` — human-facing overview
 - `NOTES.md` — long-form design rationale
 - `MODULES.md` — module map and architectural decisions
-- `DATA_MODEL.md` — SQL-ish schema (currently covers Modules 1, 2, 3, 4, 5, 12)
+- `DATA_MODEL.md` — SQL-ish schema (currently covers Modules 1, 2, 3, 4, 5, 6, 7, 8, 9, 12)
 - `SETUP.md` — first-run developer setup
 
 **Code layout**:
@@ -38,11 +38,10 @@ Entries are reverse-chronological. Most recent first.
 
 **Immediate next up**:
 
-1. **Schema cleanup** — drop `User.argon2_hash` and `User.master_key_wrapped` (migration 0008). Authoritative copies live in `identity.json`.
-2. **Password change** — rekey the wrapped master key under a new KEK. Pattern is already in place; needs a Settings UI + `auth_change_password` command.
-3. **Extend `DATA_MODEL.md` to Modules 6–9** (Testing, Evidence, Findings, Working Papers). Needed before the access review slice.
-4. **User access review vertical slice** — the recommended first prototype module (exercises 10 of 13 modules). Starts once Modules 6–9 schema are drafted. Library is in place and can now back risk/control/test selection.
-5. **Zeroise master key in memory** — add `ZeroizeOnDrop` to the MK buffer before it reaches SQLCipher. Defensive; not a known leak.
+1. **User access review vertical slice** — the recommended first prototype module (exercises 10 of 13 modules). Schema is now drafted through Modules 6-9; this slice is next. Planned flow: scope a system → create a Test from library UAM-C-001 → upload AD export + HR leaver list as `DataImport`s → rule-based match flags terminated-but-active / dormant / orphan accounts → exceptions elevate to `Finding`s.
+2. **Schema cleanup** — drop `User.argon2_hash` and `User.master_key_wrapped` (future migration). Authoritative copies live in `identity.json`.
+3. **Password change** — rekey the wrapped master key under a new KEK. Pattern is already in place; needs a Settings UI + `auth_change_password` command.
+4. **Zeroise master key in memory** — add `ZeroizeOnDrop` to the MK buffer before it reaches SQLCipher. Defensive; not a known leak.
 
 **Library follow-ups** (do when they become load-bearing, not before):
 
@@ -53,6 +52,24 @@ Entries are reverse-chronological. Most recent first.
 ---
 
 ## Decision log
+
+### 2026-04-24 — Data model extended to Modules 6–9
+
+Schema drafted for the workflow core — Testing, Evidence, Findings, and Working Papers. Unblocks the access review vertical slice.
+
+**Module 6 (Fieldwork & Testing)** — `EngagementRisk`, `EngagementControl`, `Test`, `SamplingPlan`, `Sample`, `TestResult`, `TestConclusion`, `Connector`, `DataImport`. Engagement-level clones carry both `derived_from` (library lineage) and `prior_engagement_*_id` (carry-forward lineage); walking either chain resolves "where did this come from?" unambiguously. One `EngagementControl` → many `Test`s, one per system in scope.
+
+**Module 7 (Evidence)** — `Evidence`, `TestEvidenceLink`, `EvidenceTag`, `EvidenceProvenance`, `PBCRequest`, `PBCStatus`, `PriorYearEvidenceLink`. Provenance is append-only chain-of-custody for evidence that passes through OCR / extraction / redaction before it lands on a test. PBC status history is separate from `ActivityLog` because it drives the client-portal dashboard and overdue reminders.
+
+**Module 8 (Findings)** — `Finding` (CCCER: Condition/Criteria/Cause/Effect/Recommendation as separate blobs for independent editing and LLM-drafting), `FindingTestResultLink`, `FindingSeverity`, `RootCauseTaxonomy`, `ManagementActionPlan`, `FollowUp`, `RecurringFindingLink`. `RecurringFindingLink.match_type` spans the automation ladder: `exact_control` (rule, confidence 1.0), `same_root_cause` (rule), `semantic` (sentence-transformer, auditor-confirmable).
+
+**Module 9 (Working Papers)** — `WorkingPaper`, `WPSection`, `WPTestLink`, `ReviewNote`, `SignOff`. `WorkingPaper.wp_type` (`per_test` | `per_section` | `custom`) is advisory for the UI, not a DB rule — the three-format decision from `MODULES.md`. `SignOff` is immutable ledger; reopens create a new row, never edit history.
+
+**Resolved** (moved out of Open questions): UUID format (v7 confirmed), FK enforcement (`PRAGMA foreign_keys = ON` in `db::open_with_key`), library bundle format (covered by yesterday's work).
+
+**Still open**: JSON validation strategy, FTS5 (blocked on plaintext-at-rest trade-off for encrypted blob content), blob storage directory layout (proposed `{app_data_dir}/blobs/<eng_id>/<first-two-chars-of-blob-id>/<blob_id>.bin`).
+
+**Deliberately not in this commit**: no new tables are migrated yet. Schema is design-only until the access review slice needs a concrete subset, at which point migration 0008 will carve out the tables actually exercised — not the full set. Avoids dead tables.
 
 ### 2026-04-24 — Library module landed
 
