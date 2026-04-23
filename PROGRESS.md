@@ -8,7 +8,9 @@ Entries are reverse-chronological. Most recent first.
 
 ## Current state
 
-**Phase**: Authentication + encrypted DB live. First-run onboarding generates a random 256-bit master key, wraps it under an Argon2id-derived KEK, and persists the wrap to `identity.json`. Every subsequent sign-in unwraps the master key and opens the SQLCipher DB; logout drops the connection and re-locks the file. Library v0.1.0 baseline bundle ships with the binary, is Ed25519-verified on first open, and loads into the DB idempotently; the Library route browses it (list/detail across risks and controls, with framework / system-type / keyword filters). Application launches into an `AuthGate` → Shell pipeline with Dashboard / Clients / Engagements / Library / Settings routes.
+**Phase**: First real vertical slice live — User Access Review (Module 6/7/8 ribbon). From an engagement detail page an auditor can add a library control (clones risks + tests into the engagement), upload an AD export and an HR leavers list as encrypted `DataImport`s, run the rule-based `UAM-T-001` matcher to produce a `TestResult`, and elevate exceptions to a draft `Finding` with severity. All mutations are attributable (SyncRecord + ChangeLog + ActivityLog) and cross-firm isolated.
+
+Earlier foundations remain: authentication + encrypted DB, Ed25519-verified library v0.1.0 baseline, Clients / Engagements CRUD, and the Library browse route.
 
 **Repo / scaffolding**: Git initialised at project root. Toolchain installed (Rust 1.95 stable, Node 25). See `SETUP.md` for how to run.
 
@@ -38,9 +40,9 @@ Entries are reverse-chronological. Most recent first.
 
 **Immediate next up**:
 
-1. **User access review vertical slice** — the recommended first prototype module (exercises 10 of 13 modules). Schema is now drafted through Modules 6-9; this slice is next. Planned flow: scope a system → create a Test from library UAM-C-001 → upload AD export + HR leaver list as `DataImport`s → rule-based match flags terminated-but-active / dormant / orphan accounts → exceptions elevate to `Finding`s.
+1. **Deepen the UAR slice** — dormant-account rule + orphan-account rule (same matcher module, same test pattern), Evidence attachments on findings, CCCER-shaped finding editor (condition / criteria / cause / effect / recommendation as separate fields), and a Working Paper view that groups UAM tests.
 2. **Schema cleanup** — drop `User.argon2_hash` and `User.master_key_wrapped` (future migration). Authoritative copies live in `identity.json`.
-3. **Password change** — rekey the wrapped master key under a new KEK. Pattern is already in place; needs a Settings UI + `auth_change_password` command.
+3. **Password change UI** — the `change_password` command is already registered; Settings needs a form that calls it.
 4. **Zeroise master key in memory** — add `ZeroizeOnDrop` to the MK buffer before it reaches SQLCipher. Defensive; not a known leak.
 
 **Library follow-ups** (do when they become load-bearing, not before):
@@ -52,6 +54,26 @@ Entries are reverse-chronological. Most recent first.
 ---
 
 ## Decision log
+
+### 2026-04-24 — User access review vertical slice shipped
+
+First end-to-end feature landed. From the Engagement detail page an auditor can now:
+
+1. Add a library control (`UAM-C-001` etc.) — clones library risks, the control, and its test procedures into engagement-scoped rows with `derived_from` + `library_version` lineage.
+2. Upload an AD export and an HR leavers list tagged by purpose. Files encrypt with AES-256-GCM under a per-engagement content key; ciphertext lives on disk at `{app_data}/blobs/{eng_id}/{aa}/{blob_id}.bin` **without** the auth tag (tag stays in `EncryptedBlob` for tamper detection), row metadata in `DataImport`.
+3. Run the rule-based `UAM-T-001` matcher. CSV is parsed header-canonicalised (BOM-tolerant, quoted commas), joined email-first with a logon-name fallback, and AD rows explicitly marked disabled are skipped. Exceptions + the serialised report land as a `TestResult` blob; the `Test.status` advances to `in_review`.
+4. Elevate any exception result to a `Finding`. Codes are per-engagement sequential (`F-001`, `F-002`, …), severity defaults to `sev-medium`, condition text is machine-drafted from the matcher report, the triggering `TestResult` is linked via `FindingTestResultLink`. Pass results and cross-firm `test_result_id`s are rejected.
+
+Every mutation writes a `SyncRecord` + whole-row `ChangeLog` + `ActivityLog` row. Every read and mutation enforces the engagement → client → firm_id chain against the session firm. 53 backend tests, 0 svelte-check errors.
+
+**Migration 0008** seeds the five-level `FindingSeverity` table (`sev-critical` / `sev-high` / `sev-medium` / `sev-low` / `sev-observation`). Only the tables actually exercised by this slice were migrated — `Evidence`, `ManagementActionPlan`, `ReviewNote`, `WorkingPaper` remain design-only.
+
+**Deliberately minimal in this first cut**:
+- Matcher runs with no UI override for AD/leavers selection. Backend accepts override ids; frontend just sends `null` and the command picks the newest matching purpose. Override UI will appear when auditors start wanting to re-run against an older file.
+- Finding editor is read-only. Elevation produces a draft row with generic condition + recommendation text; inline editing + CCCER breakdown is next.
+- Evidence is not yet attached to findings. The `EncryptedBlob` the matcher writes is referenced from the `TestResult`, not surfaced as a browsable `Evidence` row.
+
+**Files of note**: `app/src-tauri/src/matcher/{csv,access_review}.rs`, `app/src-tauri/src/commands/{testing,findings}.rs`, `app/src-tauri/src/blobs/mod.rs`, `app/src-tauri/src/db/migrations/0008_testing_findings.sql`, `app/src/lib/routes/EngagementDetail.svelte`.
 
 ### 2026-04-24 — Data model extended to Modules 6–9
 
