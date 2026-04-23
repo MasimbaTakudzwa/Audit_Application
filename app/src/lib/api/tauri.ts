@@ -158,16 +158,20 @@ export interface RunAccessReviewInput {
 
 export interface AccessReviewRunResult {
   test_result_id: string;
+  rule: string;
   outcome: string;
   exception_count: number;
   ad_import_id: string;
   ad_import_filename: string | null;
-  leavers_import_id: string;
-  leavers_import_filename: string | null;
   ad_rows_considered: number;
-  leaver_rows_considered: number;
   ad_rows_skipped_disabled: number;
-  ad_rows_skipped_unmatchable: number;
+  leavers_import_id: string | null;
+  leavers_import_filename: string | null;
+  leaver_rows_considered: number | null;
+  ad_rows_skipped_unmatchable: number | null;
+  ad_rows_skipped_no_last_logon: number | null;
+  ad_rows_skipped_unparseable: number | null;
+  dormancy_threshold_days: number | null;
 }
 
 export interface TestResultSummary {

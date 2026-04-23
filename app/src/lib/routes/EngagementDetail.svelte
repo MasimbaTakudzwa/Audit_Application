@@ -31,6 +31,12 @@
     { id: "other",       label: "Other",           hint: "Any other evidence you want to retain" },
   ];
 
+  // Test codes for which the backend has a dispatchable matcher today. Keep
+  // this list in sync with `AccessReviewRule::for_test_code` in Rust — any
+  // code in here must also be dispatchable there, or the button will error
+  // when pressed.
+  const MATCHER_ENABLED_CODES = new Set(["UAM-T-001", "UAM-T-003"]);
+
   let loading = $state(true);
   let err = $state("");
 
@@ -562,7 +568,7 @@
                 {/if}
               </td>
               <td class="actions-col">
-                {#if t.automation_tier === "rule_based" && t.code.startsWith("UAM-T-")}
+                {#if t.automation_tier === "rule_based" && MATCHER_ENABLED_CODES.has(t.code)}
                   <button
                     type="button"
                     class="link"

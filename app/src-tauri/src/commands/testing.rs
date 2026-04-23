@@ -110,16 +110,23 @@ pub struct RunAccessReviewInput {
 #[derive(Debug, Serialize)]
 pub struct AccessReviewRunResult {
     pub test_result_id: String,
+    pub rule: String,
     pub outcome: String,
     pub exception_count: i64,
     pub ad_import_id: String,
     pub ad_import_filename: Option<String>,
-    pub leavers_import_id: String,
-    pub leavers_import_filename: Option<String>,
     pub ad_rows_considered: i64,
-    pub leaver_rows_considered: i64,
     pub ad_rows_skipped_disabled: i64,
-    pub ad_rows_skipped_unmatchable: i64,
+    /// Present for terminated-but-active (the HR leavers input); absent for
+    /// dormant-accounts which has no leavers input.
+    pub leavers_import_id: Option<String>,
+    pub leavers_import_filename: Option<String>,
+    pub leaver_rows_considered: Option<i64>,
+    pub ad_rows_skipped_unmatchable: Option<i64>,
+    /// Present for dormant-accounts only.
+    pub ad_rows_skipped_no_last_logon: Option<i64>,
+    pub ad_rows_skipped_unparseable: Option<i64>,
+    pub dormancy_threshold_days: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1001,6 +1008,8 @@ pub(crate) fn run_access_review(
             return Err(AppError::NotFound("test not found".into()));
         }
 
+        let rule = AccessReviewRule::for_test_code(&test.code)?;
+
         let ad_import = resolve_import(
             &tx,
             &engagement_id,
@@ -1008,37 +1017,139 @@ pub(crate) fn run_access_review(
             &["ad_export", "entra_export"],
             "AD or Entra export",
         )?;
-        let leavers_import = resolve_import(
-            &tx,
-            &engagement_id,
-            leavers_import_override.as_deref(),
-            &["hr_leavers"],
-            "HR leavers list",
-        )?;
-
         let ad_blob_id = ad_import
             .blob_id
             .clone()
             .ok_or_else(|| AppError::Message("AD export has no attached file".into()))?;
-        let leavers_blob_id = leavers_import.blob_id.clone().ok_or_else(|| {
-            AppError::Message("HR leavers list has no attached file".into())
-        })?;
-
         let ad_bytes = blobs::read_blob(&tx, &paths.app_data_dir, &ad_blob_id, &master_key)?;
-        let leavers_bytes =
-            blobs::read_blob(&tx, &paths.app_data_dir, &leavers_blob_id, &master_key)?;
-
         let ad_text = std::str::from_utf8(&ad_bytes)
             .map_err(|e| AppError::Message(format!("AD export is not valid UTF-8: {e}")))?;
-        let leavers_text = std::str::from_utf8(&leavers_bytes).map_err(|e| {
-            AppError::Message(format!("HR leavers list is not valid UTF-8: {e}"))
-        })?;
-
         let ad_table = csv_parser::parse(ad_text)?;
-        let leavers_table = csv_parser::parse(leavers_text)?;
-        let report = access_review::run_terminated_but_active(&ad_table, &leavers_table);
 
-        let report_json = serde_json::to_vec_pretty(&report)?;
+        // Per-rule dispatch. Each branch produces a `RuleOutcome` carrying
+        // everything downstream needs: the report JSON to persist, the
+        // exception counts, the detail payload, and any rule-specific extras
+        // for the return value.
+        let outcome = match rule {
+            AccessReviewRule::TerminatedButActive => {
+                let leavers_import = resolve_import(
+                    &tx,
+                    &engagement_id,
+                    leavers_import_override.as_deref(),
+                    &["hr_leavers"],
+                    "HR leavers list",
+                )?;
+                let leavers_blob_id = leavers_import.blob_id.clone().ok_or_else(|| {
+                    AppError::Message("HR leavers list has no attached file".into())
+                })?;
+                let leavers_bytes = blobs::read_blob(
+                    &tx,
+                    &paths.app_data_dir,
+                    &leavers_blob_id,
+                    &master_key,
+                )?;
+                let leavers_text = std::str::from_utf8(&leavers_bytes).map_err(|e| {
+                    AppError::Message(format!("HR leavers list is not valid UTF-8: {e}"))
+                })?;
+                let leavers_table = csv_parser::parse(leavers_text)?;
+                let report =
+                    access_review::run_terminated_but_active(&ad_table, &leavers_table);
+
+                let exception_count = report.exceptions.len() as i64;
+                let summary = if exception_count == 0 {
+                    format!(
+                        "No terminated users still enabled across {} AD rows and {} leaver rows",
+                        report.ad_rows_considered, report.leaver_rows_considered
+                    )
+                } else {
+                    format!(
+                        "{} terminated user{} still enabled in AD",
+                        exception_count,
+                        if exception_count == 1 { "" } else { "s" }
+                    )
+                };
+                let detail = json!({
+                    "rule": report.rule,
+                    "ad_import_id": ad_import.id,
+                    "leavers_import_id": leavers_import.id,
+                    "ad_rows_considered": report.ad_rows_considered,
+                    "leaver_rows_considered": report.leaver_rows_considered,
+                    "ad_rows_skipped_disabled": report.ad_rows_skipped_disabled,
+                    "ad_rows_skipped_unmatchable": report.ad_rows_skipped_unmatchable,
+                })
+                .to_string();
+                let report_json = serde_json::to_vec_pretty(&report)?;
+
+                RuleOutcome {
+                    rule: report.rule.clone(),
+                    report_json,
+                    exception_count,
+                    exception_summary: summary,
+                    detail_json: detail,
+                    ad_rows_considered: report.ad_rows_considered as i64,
+                    ad_rows_skipped_disabled: report.ad_rows_skipped_disabled as i64,
+                    leavers_import: Some(leavers_import),
+                    leaver_rows_considered: Some(report.leaver_rows_considered as i64),
+                    ad_rows_skipped_unmatchable: Some(report.ad_rows_skipped_unmatchable as i64),
+                    ad_rows_skipped_no_last_logon: None,
+                    ad_rows_skipped_unparseable: None,
+                    dormancy_threshold_days: None,
+                }
+            }
+            AccessReviewRule::DormantAccounts => {
+                let threshold_days = access_review::DORMANT_THRESHOLD_DAYS_DEFAULT;
+                let report =
+                    access_review::run_dormant_accounts(&ad_table, now, threshold_days);
+
+                let exception_count = report.exceptions.len() as i64;
+                let summary = if exception_count == 0 {
+                    format!(
+                        "No dormant accounts across {} AD rows at a {}-day threshold",
+                        report.ad_rows_considered, threshold_days
+                    )
+                } else {
+                    format!(
+                        "{} dormant account{} exceeding the {}-day threshold",
+                        exception_count,
+                        if exception_count == 1 { "" } else { "s" },
+                        threshold_days
+                    )
+                };
+                let detail = json!({
+                    "rule": report.rule,
+                    "ad_import_id": ad_import.id,
+                    "ad_rows_considered": report.ad_rows_considered,
+                    "ad_rows_skipped_disabled": report.ad_rows_skipped_disabled,
+                    "ad_rows_skipped_no_last_logon": report.ad_rows_skipped_no_last_logon,
+                    "ad_rows_skipped_unparseable": report.ad_rows_skipped_unparseable,
+                    "threshold_days": report.threshold_days,
+                    "as_of_secs": report.as_of_secs,
+                })
+                .to_string();
+                let report_json = serde_json::to_vec_pretty(&report)?;
+
+                RuleOutcome {
+                    rule: report.rule.clone(),
+                    report_json,
+                    exception_count,
+                    exception_summary: summary,
+                    detail_json: detail,
+                    ad_rows_considered: report.ad_rows_considered as i64,
+                    ad_rows_skipped_disabled: report.ad_rows_skipped_disabled as i64,
+                    leavers_import: None,
+                    leaver_rows_considered: None,
+                    ad_rows_skipped_unmatchable: None,
+                    ad_rows_skipped_no_last_logon: Some(
+                        report.ad_rows_skipped_no_last_logon as i64,
+                    ),
+                    ad_rows_skipped_unparseable: Some(
+                        report.ad_rows_skipped_unparseable as i64,
+                    ),
+                    dormancy_threshold_days: Some(report.threshold_days as i64),
+                }
+            }
+        };
+
         let report_filename = format!("access-review-{}.json", &test.code);
         let written_report = blobs::write_engagement_blob(
             &tx,
@@ -1048,36 +1159,15 @@ pub(crate) fn run_access_review(
             None,
             Some(&report_filename),
             Some("application/json"),
-            &report_json,
+            &outcome.report_json,
             &master_key,
             now,
         )?;
 
-        let exception_count = report.exceptions.len() as i64;
-        let outcome = if exception_count == 0 { "pass" } else { "exception" };
-        let exception_summary = if exception_count == 0 {
-            format!(
-                "No terminated users still enabled across {} AD rows and {} leaver rows",
-                report.ad_rows_considered, report.leaver_rows_considered
-            )
-        } else {
-            format!(
-                "{} terminated user{} still enabled in AD",
-                exception_count,
-                if exception_count == 1 { "" } else { "s" }
-            )
-        };
-
-        let detail_json = json!({
-            "rule": report.rule,
-            "ad_import_id": ad_import.id,
-            "leavers_import_id": leavers_import.id,
-            "ad_rows_considered": report.ad_rows_considered,
-            "leaver_rows_considered": report.leaver_rows_considered,
-            "ad_rows_skipped_disabled": report.ad_rows_skipped_disabled,
-            "ad_rows_skipped_unmatchable": report.ad_rows_skipped_unmatchable,
-        })
-        .to_string();
+        let exception_count = outcome.exception_count;
+        let result_outcome = if exception_count == 0 { "pass" } else { "exception" };
+        let exception_summary = outcome.exception_summary.clone();
+        let detail_json = outcome.detail_json.clone();
         let population_label = format!(
             "AD export: {}",
             ad_import.filename.as_deref().unwrap_or("(unnamed)")
@@ -1093,7 +1183,7 @@ pub(crate) fn run_access_review(
             params![
                 test_result_id,
                 test.id,
-                outcome,
+                result_outcome,
                 exception_summary,
                 exception_count,
                 session.user_id,
@@ -1125,7 +1215,7 @@ pub(crate) fn run_access_review(
                 session.user_id,
                 json!({
                     "test_id": test.id,
-                    "outcome": outcome,
+                    "outcome": result_outcome,
                     "exception_summary": exception_summary,
                     "evidence_count": exception_count,
                     "notes_blob_id": written_report.id,
@@ -1197,25 +1287,73 @@ pub(crate) fn run_access_review(
             engagement_id = %engagement_id,
             test_id = %test.id,
             test_result_id = %test_result_id,
-            outcome,
+            rule = %outcome.rule,
+            outcome = %result_outcome,
             exception_count,
             "access review matcher ran"
         );
 
+        let (leavers_import_id, leavers_import_filename) = outcome
+            .leavers_import
+            .as_ref()
+            .map(|li| (Some(li.id.clone()), li.filename.clone()))
+            .unwrap_or((None, None));
+
         Ok(AccessReviewRunResult {
             test_result_id,
-            outcome: outcome.to_string(),
+            rule: outcome.rule.clone(),
+            outcome: result_outcome.to_string(),
             exception_count,
             ad_import_id: ad_import.id,
             ad_import_filename: ad_import.filename,
-            leavers_import_id: leavers_import.id,
-            leavers_import_filename: leavers_import.filename,
-            ad_rows_considered: report.ad_rows_considered as i64,
-            leaver_rows_considered: report.leaver_rows_considered as i64,
-            ad_rows_skipped_disabled: report.ad_rows_skipped_disabled as i64,
-            ad_rows_skipped_unmatchable: report.ad_rows_skipped_unmatchable as i64,
+            leavers_import_id,
+            leavers_import_filename,
+            ad_rows_considered: outcome.ad_rows_considered,
+            leaver_rows_considered: outcome.leaver_rows_considered,
+            ad_rows_skipped_disabled: outcome.ad_rows_skipped_disabled,
+            ad_rows_skipped_unmatchable: outcome.ad_rows_skipped_unmatchable,
+            ad_rows_skipped_no_last_logon: outcome.ad_rows_skipped_no_last_logon,
+            ad_rows_skipped_unparseable: outcome.ad_rows_skipped_unparseable,
+            dormancy_threshold_days: outcome.dormancy_threshold_days,
         })
     })
+}
+
+/// Which rule the UAR matcher should run for a given test code. Dispatch lives
+/// here so the command layer has a single point to reject tests whose code is
+/// not wired up (e.g. attempting to run the matcher on a CHG-* test).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessReviewRule {
+    TerminatedButActive,
+    DormantAccounts,
+}
+
+impl AccessReviewRule {
+    fn for_test_code(code: &str) -> AppResult<Self> {
+        match code {
+            "UAM-T-001" => Ok(Self::TerminatedButActive),
+            "UAM-T-003" => Ok(Self::DormantAccounts),
+            other => Err(AppError::Message(format!(
+                "no access review rule is wired for test code {other}"
+            ))),
+        }
+    }
+}
+
+struct RuleOutcome {
+    rule: String,
+    report_json: Vec<u8>,
+    exception_count: i64,
+    exception_summary: String,
+    detail_json: String,
+    ad_rows_considered: i64,
+    ad_rows_skipped_disabled: i64,
+    leavers_import: Option<ImportRef>,
+    leaver_rows_considered: Option<i64>,
+    ad_rows_skipped_unmatchable: Option<i64>,
+    ad_rows_skipped_no_last_logon: Option<i64>,
+    ad_rows_skipped_unparseable: Option<i64>,
+    dormancy_threshold_days: Option<i64>,
 }
 
 pub(crate) fn list_test_results(
@@ -1641,7 +1779,10 @@ mod tests {
     #[test]
     fn clone_library_control_shares_risks_between_sibling_controls() {
         // UAM-C-001 and UAM-C-002 both reference UAM-R-001. Cloning both
-        // should yield one EngagementRisk, two EngagementControls, two Tests.
+        // should collapse onto one EngagementRisk, two EngagementControls,
+        // and one Test per test procedure beneath the cloned controls. The
+        // current library (v0.2.0) ships UAM-T-001 under UAM-C-001 and
+        // UAM-T-002 + UAM-T-003 under UAM-C-002, so we expect 3 Tests.
         let (db, path) = seeded_db("firm-t2", "user-t2", "client-t2", "eng-t2");
         let auth = session_for("firm-t2", "user-t2");
 
@@ -1687,7 +1828,7 @@ mod tests {
                 [],
                 |r| r.get(0),
             )?;
-            assert_eq!(test_count, 2);
+            assert_eq!(test_count, 3);
             Ok(())
         })
         .unwrap();
@@ -2246,5 +2387,145 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, AppError::Database(_)));
         cleanup(&path);
+    }
+
+    #[test]
+    fn run_access_review_dormant_flags_stale_accounts_without_leavers_input() {
+        // Clone UAM-C-002 to get the dormant-accounts test (UAM-T-003). Upload
+        // only an AD export — no HR leavers list. The matcher should flag
+        // alice (last logon 2020-01-01) and never-signed-in carol; bob (recent)
+        // is clean.
+        let (db, db_path) = seeded_db("firm-dm1", "user-dm1", "client-dm1", "eng-dm1");
+        let auth = session_for("firm-dm1", "user-dm1");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        let clone = clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-dm1".into(),
+                library_control_id: library_control_id(&db, "UAM-C-002"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+
+        let dormant_test_id: String = db
+            .with(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-dm1' AND code = 'UAM-T-003'",
+                )?;
+                let id: String = stmt.query_row([], |r| r.get(0))?;
+                Ok(id)
+            })
+            .unwrap();
+        assert!(clone.test_ids.contains(&dormant_test_id));
+
+        // AD export with one recent sign-in, one old sign-in, one never.
+        let recent = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - (10 * 86_400);
+        let recent_ft = (recent + 11_644_473_600) * 10_000_000;
+        let ad_csv = format!(
+            "sAMAccountName,email,enabled,lastLogonTimestamp\n\
+             alice,alice@acme.com,TRUE,2020-01-01\n\
+             bob,bob@acme.com,TRUE,{recent_ft}\n\
+             carol,carol@acme.com,TRUE,0\n"
+        );
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-dm1".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "ad_export".into(),
+                filename: "ad.csv".into(),
+                mime_type: Some("text/csv".into()),
+                content: ad_csv.into_bytes(),
+            },
+        )
+        .unwrap();
+
+        let result = run_access_review(
+            &db,
+            &auth,
+            &paths,
+            RunAccessReviewInput {
+                test_id: dormant_test_id.clone(),
+                ad_import_id: None,
+                leavers_import_id: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.outcome, "exception");
+        assert_eq!(result.exception_count, 2);
+        assert_eq!(result.rule, "dormant_accounts");
+        assert_eq!(
+            result.dormancy_threshold_days,
+            Some(access_review::DORMANT_THRESHOLD_DAYS_DEFAULT as i64)
+        );
+        assert!(result.leavers_import_id.is_none());
+        assert!(result.leaver_rows_considered.is_none());
+
+        db.with(|conn| {
+            let detail: String = conn.query_row(
+                "SELECT detail_json FROM TestResult WHERE id = ?1",
+                params![result.test_result_id],
+                |r| r.get(0),
+            )?;
+            assert!(detail.contains("dormant_accounts"));
+            assert!(detail.contains("threshold_days"));
+            let test_status: String = conn.query_row(
+                "SELECT status FROM Test WHERE id = ?1",
+                params![dormant_test_id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(test_status, "in_review");
+            Ok(())
+        })
+        .unwrap();
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn run_access_review_rejects_test_code_that_has_no_rule() {
+        // CHG-T-001 has no matcher wired up; the command must reject it
+        // cleanly rather than silently falling through to a default rule.
+        let (db, db_path) = seeded_db("firm-dm2", "user-dm2", "client-dm2", "eng-dm2");
+        let auth = session_for("firm-dm2", "user-dm2");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        let clone = clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-dm2".into(),
+                library_control_id: library_control_id(&db, "CHG-C-001"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+        let chg_test_id = clone.test_ids[0].clone();
+
+        let err = run_access_review(
+            &db,
+            &auth,
+            &paths,
+            RunAccessReviewInput {
+                test_id: chg_test_id,
+                ad_import_id: None,
+                leavers_import_id: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Message(_)));
+        cleanup(&db_path);
     }
 }

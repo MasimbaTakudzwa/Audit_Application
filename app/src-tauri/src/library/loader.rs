@@ -22,15 +22,23 @@ use crate::error::{AppError, AppResult};
 
 use super::verify;
 
-/// Baseline bundle shipped with the app. Future versions are added here.
+/// Baseline bundles shipped with the app. Future versions are added here in
+/// ascending order — the loader applies them in sequence so `superseded_by`
+/// chains are built correctly.
 const BUNDLE_V0_1_0: &[u8] =
     include_bytes!("../../resources/library/v0.1.0.json");
 const BUNDLE_V0_1_0_SIG: &str =
     include_str!("../../resources/library/v0.1.0.json.sig");
 
+const BUNDLE_V0_2_0: &[u8] =
+    include_bytes!("../../resources/library/v0.2.0.json");
+const BUNDLE_V0_2_0_SIG: &str =
+    include_str!("../../resources/library/v0.2.0.json.sig");
+
 /// Install every baseline bundle shipped with the app into `conn`. Idempotent.
 pub fn install_baseline_bundles(conn: &mut Connection) -> AppResult<()> {
     install_bundle(conn, BUNDLE_V0_1_0, BUNDLE_V0_1_0_SIG)?;
+    install_bundle(conn, BUNDLE_V0_2_0, BUNDLE_V0_2_0_SIG)?;
     Ok(())
 }
 
@@ -366,42 +374,84 @@ mod tests {
         db.with_mut(|conn| install_baseline_bundles(conn)).unwrap();
 
         db.with(|conn| {
-            let risks: i64 = conn.query_row(
+            // v0.1.0 rows are still present, but the prior-version codes that
+            // also exist in v0.2.0 are marked `superseded_by` the v0.2.0 rows.
+            let risks_v1: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM LibraryRisk WHERE library_version = '0.1.0'",
                 [],
                 |r| r.get(0),
             )?;
-            assert_eq!(risks, 3);
+            assert_eq!(risks_v1, 3);
+            let risks_v2: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM LibraryRisk WHERE library_version = '0.2.0'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(risks_v2, 3);
+            let risks_superseded: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM LibraryRisk
+                 WHERE library_version = '0.1.0' AND superseded_by IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(risks_superseded, 3);
 
-            let controls: i64 = conn.query_row(
+            let controls_v1: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM LibraryControl WHERE library_version = '0.1.0'",
                 [],
                 |r| r.get(0),
             )?;
-            assert_eq!(controls, 5);
+            assert_eq!(controls_v1, 5);
+            let controls_v2: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM LibraryControl WHERE library_version = '0.2.0'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(controls_v2, 5);
 
-            let test_procedures: i64 = conn.query_row(
+            let test_procedures_v1: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM TestProcedure WHERE library_version = '0.1.0'",
                 [],
                 |r| r.get(0),
             )?;
-            assert_eq!(test_procedures, 5);
-
-            let checklists: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM ExpectedEvidenceChecklist WHERE library_version = '0.1.0'",
+            assert_eq!(test_procedures_v1, 5);
+            let test_procedures_v2: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM TestProcedure WHERE library_version = '0.2.0'",
                 [],
                 |r| r.get(0),
             )?;
-            assert_eq!(checklists, 5);
+            assert_eq!(test_procedures_v2, 6);
 
-            let mappings: i64 = conn.query_row(
+            // v0.2.0 introduces UAM-T-003 (dormant-accounts review) — confirm it's present.
+            let dormant_present: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM TestProcedure
+                 WHERE code = 'UAM-T-003' AND library_version = '0.2.0'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(dormant_present, 1);
+
+            let checklists_v2: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ExpectedEvidenceChecklist WHERE library_version = '0.2.0'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(checklists_v2, 6);
+
+            // Each control carries 2 framework mappings. 5 controls per version × 2 = 10 per
+            // version. The two bundles together carry 20.
+            let mappings_v1: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM FrameworkMapping WHERE library_version = '0.1.0'",
                 [],
                 |r| r.get(0),
             )?;
-            // Each control has 2 mappings (5 × 2 = 10). Risks in this bundle
-            // carry none — framework references are on the control layer.
-            assert_eq!(mappings, 10);
+            assert_eq!(mappings_v1, 10);
+            let mappings_v2: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM FrameworkMapping WHERE library_version = '0.2.0'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(mappings_v2, 10);
             Ok(())
         })
         .unwrap();

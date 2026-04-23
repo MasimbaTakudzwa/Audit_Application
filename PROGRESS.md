@@ -8,9 +8,9 @@ Entries are reverse-chronological. Most recent first.
 
 ## Current state
 
-**Phase**: First real vertical slice live — User Access Review (Module 6/7/8 ribbon). From an engagement detail page an auditor can add a library control (clones risks + tests into the engagement), upload an AD export and an HR leavers list as encrypted `DataImport`s, run the rule-based `UAM-T-001` matcher to produce a `TestResult`, and elevate exceptions to a draft `Finding` with severity. All mutations are attributable (SyncRecord + ChangeLog + ActivityLog) and cross-firm isolated.
+**Phase**: First real vertical slice live — User Access Review (Module 6/7/8 ribbon). From an engagement detail page an auditor can add a library control (clones risks + tests into the engagement), upload an AD export and an HR leavers list as encrypted `DataImport`s, run a rule-based matcher — `UAM-T-001` (terminated-but-active) or `UAM-T-003` (dormant accounts) — to produce a `TestResult`, and elevate exceptions to a draft `Finding` with severity. All mutations are attributable (SyncRecord + ChangeLog + ActivityLog) and cross-firm isolated.
 
-Earlier foundations remain: authentication + encrypted DB, Ed25519-verified library v0.1.0 baseline, Clients / Engagements CRUD, and the Library browse route.
+Earlier foundations remain: authentication + encrypted DB, Ed25519-verified library baseline (now v0.1.0 + v0.2.0), Clients / Engagements CRUD, and the Library browse route.
 
 **Repo / scaffolding**: Git initialised at project root. Toolchain installed (Rust 1.95 stable, Node 25). See `SETUP.md` for how to run.
 
@@ -40,7 +40,7 @@ Earlier foundations remain: authentication + encrypted DB, Ed25519-verified libr
 
 **Immediate next up**:
 
-1. **Deepen the UAR slice** — dormant-account rule + orphan-account rule (same matcher module, same test pattern), Evidence attachments on findings, CCCER-shaped finding editor (condition / criteria / cause / effect / recommendation as separate fields), and a Working Paper view that groups UAM tests.
+1. **Deepen the UAR slice** — orphan-account rule (same matcher module, same test pattern), Evidence attachments on findings, CCCER-shaped finding editor (condition / criteria / cause / effect / recommendation as separate fields), and a Working Paper view that groups UAM tests. Dormant-account rule is now live (see 2026-04-24 entry below).
 2. **Schema cleanup** — drop `User.argon2_hash` and `User.master_key_wrapped` (future migration). Authoritative copies live in `identity.json`.
 3. **Password change UI** — the `change_password` command is already registered; Settings needs a form that calls it.
 4. **Zeroise master key in memory** — add `ZeroizeOnDrop` to the MK buffer before it reaches SQLCipher. Defensive; not a known leak.
@@ -49,11 +49,45 @@ Earlier foundations remain: authentication + encrypted DB, Ed25519-verified libr
 
 - **Firm-override UI** — editing a library entry creates a `FirmOverride` row keyed by `(code, library_version)`. Browse is read-only today; overrides were deliberately out of scope for the baseline.
 - **Library updates in-app** — today the baseline is compiled in. A later flow will let a firm drop a new `.json` + `.sig` pair into an inbox directory, verify, and install as a new version with `superseded_by` lineage. The loader already supports the upgrade path; only the pick-up-from-disk wiring is missing.
-- **Broader framework coverage** — ISO 27001 and PCI DSS mappings come in v0.2.0. Baseline only ships COBIT 2019 + NIST CSF.
+- **Broader framework coverage** — ISO 27001 and PCI DSS mappings remain deferred. v0.2.0 carries COBIT 2019 + NIST CSF forward; ISO/PCI land in a later bundle.
 
 ---
 
 ## Decision log
+
+### 2026-04-24 — Dormant-accounts matcher + library v0.2.0
+
+Second UAR rule ships. Same testing flow as the terminated-but-active rule, different matcher behind the same dispatch point.
+
+**Matcher** (`app/src-tauri/src/matcher/access_review.rs`):
+- `run_dormant_accounts(ad, as_of_secs, threshold_days)` flags AD rows whose last-sign-in is older than the threshold (default 90 days) or `"Never"`/`"0"` sentinels. Rows with no last-logon column value are skipped; unparseable values are counted and reported separately so the auditor can see data-quality noise.
+- `parse_last_logon()` handles six formats without pulling in a date crate: Windows FILETIME (17-19 digit ticks since 1601), Unix epoch seconds (9-10 digits), Unix epoch millis (13 digits), ISO 8601 date (`YYYY-MM-DD`), ISO 8601 datetime with `T` or space separator, and the `"Never"`/`"0"` sentinels. Uses Howard Hinnant's `days_from_civil` to avoid dragging in `chrono`/`time` for one conversion.
+- Returns a `DormantReport` with `ad_rows_considered`, `ad_rows_skipped_disabled`, `ad_rows_skipped_no_last_logon`, `ad_rows_skipped_unparseable`, `threshold_days`, `as_of_secs`, plus `DormantException` rows recording the original AD ordinal, the parsed timestamp, and the days-since calculation.
+
+**Library v0.2.0** (`app/src-tauri/resources/library/v0.2.0.json{,.sig}`):
+- Carries forward all v0.1.0 content (3 risks, 5 controls, 5 test procedures) plus one new procedure: `UAM-T-003` "Review of dormant application accounts" under `UAM-C-002`. `sampling_default: "none"` because the rule runs against the full AD population.
+- Same Ed25519 signing flow as v0.1.0. Bundle signed with the private key at `~/.config/audit-app/signing/library.key`, `.sig` committed alongside the JSON.
+- `loader::install_baseline_bundles` now installs v0.1.0 then v0.2.0 in sequence. v0.1.0 rows that share a `code` with v0.2.0 rows get `superseded_by` set, so `WHERE superseded_by IS NULL` returns the current set (3 + 3 risks, 5 + 5 controls, 5 + 6 test procedures). The duplication is intentional — it exercises the upgrade path on every fresh install, giving us confidence the superseding logic works before we ship a real v0.3.0.
+
+**Rule dispatch** (`commands/testing.rs`):
+- Introduced `AccessReviewRule` enum with `TerminatedButActive` and `DormantAccounts` variants plus `for_test_code(&str) -> Option<Self>`. `run_access_review` now branches on the test's `code`: the terminated rule resolves a leavers import; the dormant rule doesn't need one. A test code that has no matching rule returns `AppError::Message` rather than silently running the wrong matcher.
+- `AccessReviewRunResult` refactored to honestly represent both rules: `leavers_import_id` / `leavers_import_filename` / `leaver_rows_considered` / `ad_rows_skipped_unmatchable` are now `Option`, and the struct gains `rule`, `ad_rows_skipped_no_last_logon`, `ad_rows_skipped_unparseable`, `dormancy_threshold_days`.
+- `RuleOutcome` intermediate struct carries everything downstream (TestResult insert, ChangeLog, ActivityLog, tracing) needs regardless of which rule ran. Keeps the persistence layer rule-agnostic.
+
+**UI** (`app/src/lib/routes/EngagementDetail.svelte`):
+- `MATCHER_ENABLED_CODES = new Set(["UAM-T-001", "UAM-T-003"])` replaces the previous `startsWith("UAM-T-")` check. `UAM-T-002` (manual access-review completeness test) no longer renders a "Run matcher" button it couldn't honour.
+- `AccessReviewRunResult` TypeScript interface updated to mirror the new Rust shape; fields render defensively when null.
+
+**Verified**:
+- `cargo test --lib` — 67 passing (up from 53). New tests: seven in `matcher::access_review::tests` covering threshold flagging, Windows FILETIME + `"Never"` sentinel, missing last-logon column vs missing value, unparseable counting, ISO 8601 parsing; two in `commands::testing::tests` covering dormant-rule happy path (no leavers needed, 2 exceptions from stale timestamps) and rejection when `run_access_review` is called against a test code with no rule (`CHG-T-001`).
+- `svelte-check` — 92 files, 0 errors, 0 warnings.
+- `clone_library_control_shares_risks_between_sibling_controls` asserts `test_count == 3` now — cloning `UAM-C-002` with v0.2.0 applied produces two `Test` rows (`UAM-T-002` and `UAM-T-003`).
+
+**Deliberately deferred**:
+- No UI for overriding the 90-day threshold or the `as_of` date. Backend threshold is a `u32` parameter; the command currently hardcodes the default and `as_of = SystemTime::now()`. A per-engagement policy config will plug in when a second firm asks for a different window.
+- Orphan-account rule (AD rows with no matching HR master) is the next rule in this module. Same shape — add a variant, add a matcher, add a library test procedure.
+
+**Files of note**: `app/src-tauri/src/matcher/access_review.rs`, `app/src-tauri/src/commands/testing.rs`, `app/src-tauri/src/library/loader.rs`, `app/src-tauri/resources/library/v0.2.0.json{,.sig}`, `app/src/lib/api/tauri.ts`, `app/src/lib/routes/EngagementDetail.svelte`.
 
 ### 2026-04-24 — User access review vertical slice shipped
 
