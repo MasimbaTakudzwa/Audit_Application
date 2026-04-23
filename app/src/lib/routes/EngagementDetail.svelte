@@ -45,6 +45,15 @@
   let elevatingResultId = $state<string | null>(null);
   let elevateErr = $state("");
 
+  // Finding editor state.
+  let editingFindingId = $state<string | null>(null);
+  let editTitle = $state("");
+  let editCondition = $state("");
+  let editRecommendation = $state("");
+  let editSeverity = $state("");
+  let savingEdit = $state(false);
+  let editErr = $state("");
+
   // Upload state.
   let showUpload = $state(false);
   let submittingUpload = $state(false);
@@ -207,6 +216,42 @@
       addControlErr = String(e);
     } finally {
       addingControl = false;
+    }
+  }
+
+  function startEditFinding(f: FindingSummary) {
+    editingFindingId = f.id;
+    editTitle = f.title;
+    editCondition = f.condition_text ?? "";
+    editRecommendation = f.recommendation_text ?? "";
+    editSeverity = f.severity_id ?? (severities[0]?.id ?? "");
+    editErr = "";
+  }
+
+  function cancelEditFinding() {
+    editingFindingId = null;
+    editErr = "";
+  }
+
+  async function saveEditFinding(event: Event) {
+    event.preventDefault();
+    if (!engagement || !editingFindingId) return;
+    editErr = "";
+    savingEdit = true;
+    try {
+      const updated = await api.engagementUpdateFinding({
+        finding_id: editingFindingId,
+        title: editTitle,
+        condition_text: editCondition,
+        recommendation_text: editRecommendation,
+        severity_id: editSeverity,
+      });
+      findings = findings.map((f) => (f.id === updated.id ? updated : f));
+      editingFindingId = null;
+    } catch (e) {
+      editErr = String(e);
+    } finally {
+      savingEdit = false;
     }
   }
 
@@ -642,28 +687,86 @@
             <th>Control</th>
             <th>Identified</th>
             <th>By</th>
+            <th class="actions-col"></th>
           </tr>
         </thead>
         <tbody>
           {#each findings as f (f.id)}
-            <tr>
-              <td><code>{f.code}</code></td>
-              <td>
-                <div>{f.title}</div>
-                {#if f.condition_text}
-                  <div class="faint small">{f.condition_text}</div>
-                {/if}
-              </td>
-              <td>
-                <span class={severityPillClass(f.severity_id)}>
-                  {severityLabel(f.severity_id)}
-                </span>
-              </td>
-              <td class="accent">{f.status.replace(/_/g, " ")}</td>
-              <td class="muted">{f.control_code ?? "—"}</td>
-              <td class="faint">{fmtDate(f.identified_at)}</td>
-              <td class="faint">{f.identified_by_name ?? "—"}</td>
-            </tr>
+            {#if editingFindingId === f.id}
+              <tr class="editing">
+                <td colspan="8">
+                  <form class="form finding-form" onsubmit={saveEditFinding}>
+                    <h3>Edit {f.code}</h3>
+                    <label>
+                      <span class="label">Title</span>
+                      <input type="text" bind:value={editTitle} required />
+                    </label>
+                    <label>
+                      <span class="label">Severity</span>
+                      <select bind:value={editSeverity} required>
+                        {#each severities as s (s.id)}
+                          <option value={s.id}>{s.name}</option>
+                        {/each}
+                      </select>
+                    </label>
+                    <label>
+                      <span class="label">Condition</span>
+                      <textarea rows="4" bind:value={editCondition}></textarea>
+                      <span class="faint hint">
+                        What the test identified — facts, not opinion. Leave blank to clear.
+                      </span>
+                    </label>
+                    <label>
+                      <span class="label">Recommendation</span>
+                      <textarea rows="4" bind:value={editRecommendation}></textarea>
+                      <span class="faint hint">
+                        Practical remediation the auditor is asking management to do.
+                      </span>
+                    </label>
+                    {#if editErr}
+                      <p class="form-err">{editErr}</p>
+                    {/if}
+                    <div class="form-actions">
+                      <button type="button" onclick={cancelEditFinding} disabled={savingEdit}>
+                        Cancel
+                      </button>
+                      <button type="submit" class="primary" disabled={savingEdit}>
+                        {savingEdit ? "Saving…" : "Save"}
+                      </button>
+                    </div>
+                  </form>
+                </td>
+              </tr>
+            {:else}
+              <tr>
+                <td><code>{f.code}</code></td>
+                <td>
+                  <div>{f.title}</div>
+                  {#if f.condition_text}
+                    <div class="faint small">{f.condition_text}</div>
+                  {/if}
+                </td>
+                <td>
+                  <span class={severityPillClass(f.severity_id)}>
+                    {severityLabel(f.severity_id)}
+                  </span>
+                </td>
+                <td class="accent">{f.status.replace(/_/g, " ")}</td>
+                <td class="muted">{f.control_code ?? "—"}</td>
+                <td class="faint">{fmtDate(f.identified_at)}</td>
+                <td class="faint">{f.identified_by_name ?? "—"}</td>
+                <td class="actions-col">
+                  <button
+                    type="button"
+                    class="link"
+                    onclick={() => startEditFinding(f)}
+                    disabled={editingFindingId !== null}
+                  >
+                    Edit
+                  </button>
+                </td>
+              </tr>
+            {/if}
           {/each}
         </tbody>
       </table>
@@ -746,10 +849,23 @@
     border-radius: 2px;
   }
   .form input[type="file"] { padding: var(--sp-2); }
-  .form input:focus, .form select:focus {
+  .form textarea {
+    font: inherit;
+    padding: var(--sp-2) var(--sp-3);
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    border-radius: 2px;
+    resize: vertical;
+    min-height: 64px;
+  }
+  .form input:focus, .form select:focus, .form textarea:focus {
     outline: none;
     border-color: var(--accent);
   }
+
+  .finding-form { max-width: none; margin: var(--sp-3) 0; }
+  tr.editing td { background: var(--accent-soft); }
   .hint { font-size: 12px; }
   .form-actions {
     display: flex;

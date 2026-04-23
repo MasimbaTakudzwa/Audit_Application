@@ -71,6 +71,7 @@ pub fn run() {
             commands::testing::engagement_run_access_review,
             commands::testing::engagement_list_test_results,
             commands::findings::engagement_elevate_finding,
+            commands::findings::engagement_update_finding,
             commands::findings::engagement_list_findings,
             commands::findings::list_finding_severities,
         ])

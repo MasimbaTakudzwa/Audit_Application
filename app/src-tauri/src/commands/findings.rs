@@ -41,6 +41,16 @@ pub struct ElevateFindingInput {
     pub severity_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UpdateFindingInput {
+    pub finding_id: String,
+    pub title: String,
+    /// Empty string clears the column to NULL.
+    pub condition_text: Option<String>,
+    pub recommendation_text: Option<String>,
+    pub severity_id: String,
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct FindingSummary {
     pub id: String,
@@ -100,6 +110,15 @@ pub fn list_finding_severities(
     auth: State<'_, AuthState>,
 ) -> AppResult<Vec<SeveritySummary>> {
     list_severities(db.inner(), auth.inner())
+}
+
+#[tauri::command]
+pub fn engagement_update_finding(
+    input: UpdateFindingInput,
+    db: State<'_, DbState>,
+    auth: State<'_, AuthState>,
+) -> AppResult<FindingSummary> {
+    update_finding(db.inner(), auth.inner(), input)
 }
 
 pub(crate) fn elevate_finding(
@@ -449,6 +468,280 @@ pub(crate) fn list_severities(
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     })
+}
+
+pub(crate) fn update_finding(
+    db: &DbState,
+    auth: &AuthState,
+    input: UpdateFindingInput,
+) -> AppResult<FindingSummary> {
+    let session = auth.require()?;
+    let finding_id = input.finding_id.trim().to_string();
+    if finding_id.is_empty() {
+        return Err(AppError::Message("finding is required".into()));
+    }
+    let title = input.title.trim().to_string();
+    if title.is_empty() {
+        return Err(AppError::Message("title is required".into()));
+    }
+    let severity_id = input.severity_id.trim().to_string();
+    if severity_id.is_empty() {
+        return Err(AppError::Message("severity is required".into()));
+    }
+    let condition = input
+        .condition_text
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let recommendation = input
+        .recommendation_text
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let now = now_secs();
+
+    db.with_mut(|conn| {
+        let tx = conn.transaction()?;
+
+        let existing = tx
+            .query_row(
+                "SELECT f.engagement_id, f.code, f.title, f.condition_text,
+                        f.recommendation_text, f.severity_id, f.status,
+                        f.test_id, t.code, f.engagement_control_id, ec.code,
+                        f.identified_at, f.identified_by, c.firm_id
+                 FROM Finding f
+                 JOIN Engagement e ON e.id = f.engagement_id
+                 JOIN Client c ON c.id = e.client_id
+                 LEFT JOIN Test t ON t.id = f.test_id
+                 LEFT JOIN EngagementControl ec ON ec.id = f.engagement_control_id
+                 WHERE f.id = ?1",
+                params![finding_id],
+                |r| {
+                    Ok(ExistingFinding {
+                        engagement_id: r.get(0)?,
+                        code: r.get(1)?,
+                        title: r.get(2)?,
+                        condition: r.get(3)?,
+                        recommendation: r.get(4)?,
+                        severity_id: r.get(5)?,
+                        status: r.get(6)?,
+                        test_id: r.get(7)?,
+                        test_code: r.get(8)?,
+                        engagement_control_id: r.get(9)?,
+                        control_code: r.get(10)?,
+                        identified_at: r.get(11)?,
+                        identified_by: r.get(12)?,
+                        firm_id: r.get(13)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| AppError::NotFound("finding not found".into()))?;
+
+        if existing.firm_id != session.firm_id {
+            return Err(AppError::NotFound("finding not found".into()));
+        }
+
+        let severity_name: String = tx
+            .query_row(
+                "SELECT name FROM FindingSeverity WHERE id = ?1",
+                params![severity_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| AppError::NotFound("severity not found".into()))?;
+
+        // Build list of fields that actually changed. If none, return the current
+        // projection without writing — keeps the audit trail free of noop saves.
+        let changes: Vec<(&str, Option<String>, Option<String>)> = [
+            (
+                "title",
+                Some(existing.title.clone()),
+                Some(title.clone()),
+            ),
+            (
+                "condition_text",
+                existing.condition.clone(),
+                condition.clone(),
+            ),
+            (
+                "recommendation_text",
+                existing.recommendation.clone(),
+                recommendation.clone(),
+            ),
+            (
+                "severity_id",
+                existing.severity_id.clone(),
+                Some(severity_id.clone()),
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, old, new)| old != new)
+        .collect();
+
+        let linked: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT test_result_id FROM FindingTestResultLink WHERE finding_id = ?1",
+            )?;
+            let rows: Vec<String> = stmt
+                .query_map(params![finding_id], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+
+        let identified_by_name: Option<String> = match &existing.identified_by {
+            Some(uid) => tx
+                .query_row(
+                    "SELECT display_name FROM User WHERE id = ?1",
+                    params![uid],
+                    |r| r.get(0),
+                )
+                .optional()?,
+            None => None,
+        };
+
+        if changes.is_empty() {
+            tx.commit()?;
+            return Ok(FindingSummary {
+                id: finding_id,
+                engagement_id: existing.engagement_id,
+                code: existing.code,
+                title: existing.title,
+                condition_text: existing.condition,
+                recommendation_text: existing.recommendation,
+                severity_id: existing.severity_id,
+                severity_name: Some(severity_name),
+                status: existing.status,
+                test_id: existing.test_id,
+                test_code: existing.test_code,
+                engagement_control_id: existing.engagement_control_id,
+                control_code: existing.control_code,
+                identified_at: existing.identified_at,
+                identified_by_name,
+                linked_test_result_ids: linked,
+            });
+        }
+
+        tx.execute(
+            "UPDATE Finding
+             SET title = ?1, condition_text = ?2, recommendation_text = ?3, severity_id = ?4
+             WHERE id = ?5",
+            params![title, condition, recommendation, severity_id, finding_id],
+        )?;
+
+        let sync_id: String = match tx
+            .query_row(
+                "SELECT id FROM SyncRecord
+                 WHERE entity_type = 'Finding' AND entity_id = ?1",
+                params![finding_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            Some(id) => {
+                tx.execute(
+                    "UPDATE SyncRecord
+                     SET last_modified_at = ?1, last_modified_by = ?2, version = version + 1
+                     WHERE id = ?3",
+                    params![now, session.user_id, id],
+                )?;
+                id
+            }
+            None => {
+                let new_id = Uuid::now_v7().to_string();
+                tx.execute(
+                    "INSERT INTO SyncRecord (
+                        id, entity_type, entity_id, last_modified_at,
+                        last_modified_by, version, deleted, sync_state
+                     ) VALUES (?1, 'Finding', ?2, ?3, ?4, 1, 0, 'local_only')",
+                    params![new_id, finding_id, now, session.user_id],
+                )?;
+                new_id
+            }
+        };
+
+        for (field, old, new) in &changes {
+            tx.execute(
+                "INSERT INTO ChangeLog (
+                    id, sync_record_id, occurred_at, user_id,
+                    field_name, old_value_json, new_value_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    Uuid::now_v7().to_string(),
+                    sync_id,
+                    now,
+                    session.user_id,
+                    field,
+                    old.as_ref().map(|s| json!(s).to_string()),
+                    new.as_ref().map(|s| json!(s).to_string()),
+                ],
+            )?;
+        }
+
+        tx.execute(
+            "INSERT INTO ActivityLog (
+                id, engagement_id, entity_type, entity_id,
+                action, performed_by, performed_at, summary
+             ) VALUES (?1, ?2, 'Finding', ?3, 'edited', ?4, ?5, ?6)",
+            params![
+                Uuid::now_v7().to_string(),
+                existing.engagement_id,
+                finding_id,
+                session.user_id,
+                now,
+                format!(
+                    "Edited finding {} ({} field{} changed)",
+                    existing.code,
+                    changes.len(),
+                    if changes.len() == 1 { "" } else { "s" }
+                ),
+            ],
+        )?;
+
+        tx.commit()?;
+
+        tracing::info!(
+            engagement_id = %existing.engagement_id,
+            finding_id = %finding_id,
+            code = %existing.code,
+            fields_changed = changes.len(),
+            "finding edited"
+        );
+
+        Ok(FindingSummary {
+            id: finding_id,
+            engagement_id: existing.engagement_id,
+            code: existing.code,
+            title,
+            condition_text: condition,
+            recommendation_text: recommendation,
+            severity_id: Some(severity_id),
+            severity_name: Some(severity_name),
+            status: existing.status,
+            test_id: existing.test_id,
+            test_code: existing.test_code,
+            engagement_control_id: existing.engagement_control_id,
+            control_code: existing.control_code,
+            identified_at: existing.identified_at,
+            identified_by_name,
+            linked_test_result_ids: linked,
+        })
+    })
+}
+
+struct ExistingFinding {
+    engagement_id: String,
+    code: String,
+    title: String,
+    condition: Option<String>,
+    recommendation: Option<String>,
+    severity_id: Option<String>,
+    status: String,
+    test_id: Option<String>,
+    test_code: Option<String>,
+    engagement_control_id: Option<String>,
+    control_code: Option<String>,
+    identified_at: i64,
+    identified_by: Option<String>,
+    firm_id: String,
 }
 
 struct ResultRow {
@@ -844,6 +1137,227 @@ mod tests {
         assert_eq!(sevs.len(), 5);
         assert_eq!(sevs[0].id, "sev-critical");
         assert_eq!(sevs[4].id, "sev-observation");
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn update_finding_edits_fields_and_records_change_log() {
+        let (db, db_path) = seeded_db("firm-f6", "user-f6", "client-f6", "eng-f6");
+        let auth = session_for("firm-f6", "user-f6");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+        let result_id = seed_with_exception(&db, &auth, &paths, "eng-f6");
+        let finding = elevate_finding(
+            &db,
+            &auth,
+            ElevateFindingInput {
+                test_result_id: result_id,
+                title: None,
+                severity_id: None,
+            },
+        )
+        .unwrap();
+
+        let updated = update_finding(
+            &db,
+            &auth,
+            UpdateFindingInput {
+                finding_id: finding.id.clone(),
+                title: "Terminated employees retained access".into(),
+                condition_text: Some(
+                    "Two terminated employees still had enabled AD accounts 30 days after departure.".into(),
+                ),
+                recommendation_text: Some(
+                    "Disable the identified accounts within 24 hours and re-run the matcher.".into(),
+                ),
+                severity_id: "sev-high".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(updated.title, "Terminated employees retained access");
+        assert_eq!(updated.severity_id.as_deref(), Some("sev-high"));
+        assert_eq!(updated.severity_name.as_deref(), Some("High"));
+        assert!(updated.recommendation_text.as_deref().unwrap().contains("24 hours"));
+
+        db.with(|conn| {
+            let sync_id: String = conn.query_row(
+                "SELECT id FROM SyncRecord
+                 WHERE entity_type = 'Finding' AND entity_id = ?1",
+                params![finding.id],
+                |r| r.get(0),
+            )?;
+            let version: i64 = conn.query_row(
+                "SELECT version FROM SyncRecord WHERE id = ?1",
+                params![sync_id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(version, 2);
+
+            let changes: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ChangeLog WHERE sync_record_id = ?1",
+                params![sync_id],
+                |r| r.get(0),
+            )?;
+            // One whole-row entry from elevation (field_name='.') + four
+            // field-level entries from this update.
+            assert_eq!(changes, 5);
+
+            let activity: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ActivityLog
+                 WHERE entity_type = 'Finding'
+                   AND entity_id = ?1
+                   AND action = 'edited'",
+                params![finding.id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(activity, 1);
+            Ok(())
+        })
+        .unwrap();
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn update_finding_is_noop_when_nothing_changes() {
+        let (db, db_path) = seeded_db("firm-f7", "user-f7", "client-f7", "eng-f7");
+        let auth = session_for("firm-f7", "user-f7");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+        let result_id = seed_with_exception(&db, &auth, &paths, "eng-f7");
+        let finding = elevate_finding(
+            &db,
+            &auth,
+            ElevateFindingInput {
+                test_result_id: result_id,
+                title: None,
+                severity_id: None,
+            },
+        )
+        .unwrap();
+
+        let _ = update_finding(
+            &db,
+            &auth,
+            UpdateFindingInput {
+                finding_id: finding.id.clone(),
+                title: finding.title.clone(),
+                condition_text: finding.condition_text.clone(),
+                recommendation_text: finding.recommendation_text.clone(),
+                severity_id: finding.severity_id.clone().unwrap(),
+            },
+        )
+        .unwrap();
+
+        db.with(|conn| {
+            let version: i64 = conn.query_row(
+                "SELECT version FROM SyncRecord
+                 WHERE entity_type = 'Finding' AND entity_id = ?1",
+                params![finding.id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(version, 1);
+            let activity: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ActivityLog
+                 WHERE entity_type = 'Finding'
+                   AND entity_id = ?1
+                   AND action = 'edited'",
+                params![finding.id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(activity, 0);
+            Ok(())
+        })
+        .unwrap();
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn update_finding_rejects_cross_firm() {
+        let (db, db_path) = seeded_db("firm-f8", "user-f8", "client-f8", "eng-f8");
+        let owner = session_for("firm-f8", "user-f8");
+        let other = session_for("firm-other", "user-f8");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+        let result_id = seed_with_exception(&db, &owner, &paths, "eng-f8");
+        let finding = elevate_finding(
+            &db,
+            &owner,
+            ElevateFindingInput {
+                test_result_id: result_id,
+                title: None,
+                severity_id: None,
+            },
+        )
+        .unwrap();
+
+        let err = update_finding(
+            &db,
+            &other,
+            UpdateFindingInput {
+                finding_id: finding.id,
+                title: "hijack".into(),
+                condition_text: None,
+                recommendation_text: None,
+                severity_id: "sev-high".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)));
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn update_finding_rejects_unknown_severity() {
+        let (db, db_path) = seeded_db("firm-f9", "user-f9", "client-f9", "eng-f9");
+        let auth = session_for("firm-f9", "user-f9");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+        let result_id = seed_with_exception(&db, &auth, &paths, "eng-f9");
+        let finding = elevate_finding(
+            &db,
+            &auth,
+            ElevateFindingInput {
+                test_result_id: result_id,
+                title: None,
+                severity_id: None,
+            },
+        )
+        .unwrap();
+
+        let err = update_finding(
+            &db,
+            &auth,
+            UpdateFindingInput {
+                finding_id: finding.id,
+                title: finding.title,
+                condition_text: finding.condition_text,
+                recommendation_text: finding.recommendation_text,
+                severity_id: "sev-bogus".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)));
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn update_finding_rejects_missing_id() {
+        let (db, db_path) = seeded_db("firm-f10", "user-f10", "client-f10", "eng-f10");
+        let auth = session_for("firm-f10", "user-f10");
+        let err = update_finding(
+            &db,
+            &auth,
+            UpdateFindingInput {
+                finding_id: "does-not-exist".into(),
+                title: "ignored".into(),
+                condition_text: None,
+                recommendation_text: None,
+                severity_id: "sev-medium".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)));
         cleanup(&db_path);
     }
 }

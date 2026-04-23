@@ -192,6 +192,14 @@ export interface ElevateFindingInput {
   severity_id: string | null;
 }
 
+export interface UpdateFindingInput {
+  finding_id: string;
+  title: string;
+  condition_text: string | null;
+  recommendation_text: string | null;
+  severity_id: string;
+}
+
 export interface FindingSummary {
   id: string;
   engagement_id: string;
@@ -323,6 +331,8 @@ export const api = {
     }),
   engagementElevateFinding: (input: ElevateFindingInput) =>
     invoke<FindingSummary>("engagement_elevate_finding", { input }),
+  engagementUpdateFinding: (input: UpdateFindingInput) =>
+    invoke<FindingSummary>("engagement_update_finding", { input }),
   engagementListFindings: (engagementId: string) =>
     invoke<FindingSummary[]>("engagement_list_findings", { engagementId }),
   listFindingSeverities: () =>
