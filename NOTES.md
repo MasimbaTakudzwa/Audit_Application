@@ -116,6 +116,78 @@ Con: slightly more complex than pure cloning (one extra column on cloned records
 
 The con is low cost and the benefits are large. This is also the pattern most mature audit tools converge on — useful sanity check.
 
+## Library bundle format
+
+The risk/control/test-procedure library ships as a signed JSON bundle, loaded into the DB at app startup. Two files per version:
+
+- `app/src-tauri/resources/library/v<X.Y.Z>.json` — payload (risks, controls, test procedures, evidence checklists, framework mappings, plus a small header).
+- `app/src-tauri/resources/library/v<X.Y.Z>.json.sig` — Ed25519 detached signature over the raw bytes of the JSON file. Hex-encoded ASCII, no newline.
+
+**Why detached signature over canonical JSON.** Canonical JSON (sorted keys, stripped whitespace, normalised numbers) is annoying to get right across two implementations (Rust loader + tool). Signing the raw file bytes avoids the problem: whatever bytes shipped are what was signed. The bundle file is never re-serialised in flight — it's read, verified, then parsed.
+
+**Why a signature at all.** Library bundles contain audit methodology. A swapped or tampered bundle changes what the app tests, which controls it references, and what framework mappings appear in reports. The signature protects against a malicious or accidental bundle swap at install or update time. It is not a licensing mechanism.
+
+**Public key location.** Baked into the Rust binary as a `const [u8; 32]` in `src-tauri/src/library/verify.rs`. Swapping it requires a recompile. Intentionally: a product update that includes a new library version also includes a new verifier if the key rotates, so the key lifecycle is tied to release cadence.
+
+**Private key location.** Outside the repo, outside the app. Held by Simba. The dev-machine convention is `~/.config/audit-app/signing/library.key` (0600 perms, user-only). Production signing happens on a machine Simba controls; the key is never checked in and is backed up to encrypted offline storage.
+
+**Signing tool.** `tools/sign-library-bundle/` — a standalone Rust CLI, not part of the app binary. Subcommands: `keygen` (one-off at setup), `sign`, `verify`. The app never signs; it only verifies.
+
+**Bundle shape** — one top-level object:
+
+```json
+{
+  "version": "0.1.0",
+  "published_at": 1745366400,
+  "frameworks_included": ["COBIT 2019", "NIST CSF"],
+  "risks": [
+    {
+      "code": "UAM-R-001",
+      "title": "...",
+      "description": "...",
+      "applicable_system_types": ["generic-erp", "core-banking"],
+      "default_inherent_rating": "high",
+      "framework_mappings": [{"framework": "COBIT 2019", "reference": "DSS05.04"}]
+    }
+  ],
+  "controls": [
+    {
+      "code": "UAM-C-001",
+      "title": "...",
+      "description": "...",
+      "objective": "...",
+      "applicable_system_types": ["generic-erp"],
+      "control_type": "detective",
+      "frequency": "quarterly",
+      "related_risk_codes": ["UAM-R-001"],
+      "framework_mappings": [{"framework": "NIST CSF", "reference": "PR.AC-1"}]
+    }
+  ],
+  "test_procedures": [
+    {
+      "code": "UAM-T-001",
+      "control_code": "UAM-C-001",
+      "name": "...",
+      "objective": "...",
+      "steps": ["...", "..."],
+      "sampling_default": "attribute",
+      "automation_hint": "rule-based",
+      "evidence_checklist": {"items": ["...", "..."]}
+    }
+  ]
+}
+```
+
+**Why inline evidence checklists and framework mappings**, even though they are separate tables in the schema: authors should not have to invent cross-reference IDs. The loader splits inline structures into separate rows at insert time, generating UUIDs and resolving code-to-UUID links. The on-disk schema stays normalised; the author-facing format stays flat.
+
+**Code-based cross-references throughout the bundle.** `control_code`, `related_risk_codes`, `test_procedure_code` — not UUIDs. The bundle never contains DB-layer UUIDs. This makes bundles reproducible across machines and avoids a class of "why is the same bundle generating different IDs" bugs.
+
+**Version uniqueness.** `(code, library_version)` is unique per table. Re-loading the same version is idempotent: the loader checks for existing rows with the bundle's `library_version` and exits early if already installed. Upgrading to a new version inserts fresh rows and sets `superseded_by` on any prior-version rows that share a `code`.
+
+**No DB-layer row IDs in the bundle.** Bundle entities have a `code` (stable, human-readable, e.g. `UAM-C-001`). The loader generates UUIDs on first insert. Cross-references inside the bundle use codes (`related_risk_codes`, `control_code`) not UUIDs, so the bundle author never has to invent IDs and the same bundle produces the same DB structure on any machine.
+
+**What is not in the bundle.** No `FirmOverride` rows — those are firm-local customisations. No `Engagement`-level clones — those are written per-engagement at scope time. The bundle is the vendor-shipped baseline; everything downstream layers on top.
+
 ## Open question: how much of the client portal should reuse the writing-site codebase?
 
 The writing site (`/Users/simsbgang/Desktop/Fun Website Project`) has an established visual language, typography, theme-toggle, and responsive behaviour. A case could be made to reuse some of its CSS and component patterns for the client portal to save time and maintain aesthetic coherence.

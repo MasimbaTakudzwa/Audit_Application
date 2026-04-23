@@ -8,7 +8,7 @@ Entries are reverse-chronological. Most recent first.
 
 ## Current state
 
-**Phase**: Authentication + encrypted DB live. First-run onboarding generates a random 256-bit master key, wraps it under an Argon2id-derived KEK, and persists the wrap to `identity.json`. Every subsequent sign-in unwraps the master key and opens the SQLCipher DB; logout drops the connection and re-locks the file. Application launches into an `AuthGate` → Shell pipeline with Dashboard / Clients / Engagements / Library / Settings routes.
+**Phase**: Authentication + encrypted DB live. First-run onboarding generates a random 256-bit master key, wraps it under an Argon2id-derived KEK, and persists the wrap to `identity.json`. Every subsequent sign-in unwraps the master key and opens the SQLCipher DB; logout drops the connection and re-locks the file. Library v0.1.0 baseline bundle ships with the binary, is Ed25519-verified on first open, and loads into the DB idempotently; the Library route browses it (list/detail across risks and controls, with framework / system-type / keyword filters). Application launches into an `AuthGate` → Shell pipeline with Dashboard / Clients / Engagements / Library / Settings routes.
 
 **Repo / scaffolding**: Git initialised at project root. Toolchain installed (Rust 1.95 stable, Node 25). See `SETUP.md` for how to run.
 
@@ -36,42 +36,67 @@ Entries are reverse-chronological. Most recent first.
 - `{app_data_dir}/identity.json` — plaintext JSON holding login material: `argon2_hash`, `kek_salt`, `mk_nonce`, `mk_wrapped`. Must be plaintext because it is read *before* the DB is unlocked.
 - `{app_data_dir}/audit.db` — SQLCipher-encrypted DB. Unreadable without the master key recovered from `identity.json` + correct password.
 
-**Immediate next up** (planned 2026-04-24):
+**Immediate next up**:
 
-**Start here — Library module**. Last commit marked this as next; it also unblocks the access review slice since risks/controls/test procedures come from the library.
+1. **Schema cleanup** — drop `User.argon2_hash` and `User.master_key_wrapped` (migration 0008). Authoritative copies live in `identity.json`.
+2. **Password change** — rekey the wrapped master key under a new KEK. Pattern is already in place; needs a Settings UI + `auth_change_password` command.
+3. **Extend `DATA_MODEL.md` to Modules 6–9** (Testing, Evidence, Findings, Working Papers). Needed before the access review slice.
+4. **User access review vertical slice** — the recommended first prototype module (exercises 10 of 13 modules). Starts once Modules 6–9 schema are drafted. Library is in place and can now back risk/control/test selection.
+5. **Zeroise master key in memory** — add `ZeroizeOnDrop` to the MK buffer before it reaches SQLCipher. Defensive; not a known leak.
 
-1. **Library bundle format** — decide the on-disk shape:
-   - JSON or YAML for authorability; signed with an Ed25519 detached signature so tampered bundles fail to load.
-   - One bundle per library version. Contains: `LibraryRisk[]`, `LibraryControl[]`, `TestProcedure[]`, `ExpectedEvidenceChecklist[]`, `FrameworkMapping[]` (schema mirrors the tables in [0006_library.sql](app/src-tauri/src/db/migrations/0006_library.sql)).
-   - Header with `version`, `published_at`, `frameworks_included`, `signature`.
-   - Ship the signer's public key in-app; private key held by Simba.
-   - Document in `NOTES.md` under a new "Library bundle format" heading.
-2. **Baseline bundle (v0.1.0)** — small, hand-curated seed covering:
-   - Generic ITGC: Access Management, Change Management, Backup & Recovery (~10 controls total).
-   - Two system types: *generic ERP* and *core banking*.
-   - Framework refs for each control: COBIT 2019 + NIST CSF (ISO 27001, PCI DSS come later).
-   - Stored at `app/src-tauri/resources/library/v0.1.0.json` (bundled with the app, not DB-seeded).
-3. **Loader** — `src-tauri/src/library/loader.rs`:
-   - Verify signature, parse, insert into library tables in a transaction.
-   - Idempotent: running with the same version is a no-op.
-   - New-version install: insert new rows, set `superseded_by` on matching prior-version entries.
-4. **Library route** — replace the placeholder in [Library.svelte](app/src/lib/routes/Library.svelte):
-   - List/detail browser across risks, controls, test procedures.
-   - Filter by framework + system type + keyword.
-   - Firm-override affordance deferred to a follow-up; read-only browse first.
-5. **Tauri commands** — extend [library.rs](app/src-tauri/src/commands/library.rs): `library_list_controls`, `library_list_risks`, `library_list_test_procedures`, `library_get_control(id)`.
+**Library follow-ups** (do when they become load-bearing, not before):
 
-**Follow-ups (after Library lands)**:
-
-6. **Schema cleanup** — drop `User.argon2_hash` and `User.master_key_wrapped` (migration 0008). Authoritative copies live in `identity.json`.
-7. **Password change** — rekey the wrapped master key under a new KEK. Pattern is already in place; needs a Settings UI + `auth_change_password` command.
-8. **Extend `DATA_MODEL.md` to Modules 6–9** (Testing, Evidence, Findings, Working Papers). Needed before the access review slice.
-9. **User access review vertical slice** — the recommended first prototype module (exercises 10 of 13 modules). Starts once Library + Modules 6–9 schema are drafted.
-10. **Zeroise master key in memory** — add `ZeroizeOnDrop` to the MK buffer before it reaches SQLCipher. Defensive; not a known leak.
+- **Firm-override UI** — editing a library entry creates a `FirmOverride` row keyed by `(code, library_version)`. Browse is read-only today; overrides were deliberately out of scope for the baseline.
+- **Library updates in-app** — today the baseline is compiled in. A later flow will let a firm drop a new `.json` + `.sig` pair into an inbox directory, verify, and install as a new version with `superseded_by` lineage. The loader already supports the upgrade path; only the pick-up-from-disk wiring is missing.
+- **Broader framework coverage** — ISO 27001 and PCI DSS mappings come in v0.2.0. Baseline only ships COBIT 2019 + NIST CSF.
 
 ---
 
 ## Decision log
+
+### 2026-04-24 — Library module landed
+
+Library v0.1.0 ships with the binary, loads on first DB open, and is browsable from the Library route. Unblocks the access review slice — risks, controls, and test procedures now exist in-DB for any engagement to select from.
+
+**Bundle format** (documented in `NOTES.md` under "Library bundle format"):
+- Plain JSON payload + a separate `.sig` file containing a hex-encoded Ed25519 signature of the *raw bundle bytes*. Detached signature over the bytes avoids the canonical-JSON trap (no need to agree on key ordering or whitespace — we verify exactly what we read).
+- Bundle is self-contained: risks, controls, test procedures with inline evidence checklists and inline framework mappings. Cross-references use human-authored `code` strings (e.g. `UAM-C-001` → `UAM-R-001`), not UUIDs — authors never invent UUIDs, the loader assigns them.
+- One bundle per version. Version upgrades insert new rows and set `superseded_by` on prior rows sharing the same `code`.
+
+**Signing tool** (`tools/sign-library-bundle/`, standalone Cargo crate, `publish = false`):
+- Three subcommands: `keygen --out <dir>`, `sign --key <path> --bundle <path>`, `verify --pubkey <hex32> --bundle <path>`.
+- Private key lives outside the repo at `~/.config/audit-app/signing/library.key`, chmod 0600 on Unix. Documented in `tools/sign-library-bundle/README.md`.
+- Public key fingerprint: `0964b2228e5e45c67a8e7ae870a77d25b2b46f275bc0beaa65080414bc2237d9`. Baked into `app/src-tauri/src/library/verify.rs` as `LIBRARY_PUBLIC_KEY`. Rotating the key requires a recompile — intentional; key lifecycle tied to release cadence, not runtime configuration.
+
+**Baseline v0.1.0** at `app/src-tauri/resources/library/v0.1.0.json{,.sig}`:
+- 3 risks (UAM, CHG, BKP), 5 controls (UAM-C-001 through BKP-C-001), 5 test procedures, 5 inline evidence checklists, 10 framework mappings.
+- Frameworks: COBIT 2019 + NIST CSF. ISO 27001 and PCI DSS deferred to v0.2.0.
+- System types covered: `generic-erp` and `core-banking`.
+- Real audit language — test steps reference live system evidence, evidence checklists are things an auditor would actually ask for.
+
+**Loader** (`app/src-tauri/src/library/loader.rs`):
+- Called from `db::open_with_key` after migrations. Embedded via `include_bytes!` / `include_str!` so the bundle is part of the binary, not a separate file to ship.
+- Flow: verify signature → parse → idempotency check (`SELECT COUNT(*) FROM LibraryRisk WHERE library_version = ?1`) → transaction insert using `code → uuid` maps built during risk and control inserts → set `superseded_by` on prior versions sharing `code`.
+- Three tests cover fresh install, repeated install (no-op), and tampered bundle (rejected).
+
+**Commands** (`app/src-tauri/src/commands/library.rs`):
+- `library_version`, `library_list_risks`, `library_list_controls`, `library_get_control(id)`.
+- Filter all list queries on `superseded_by IS NULL` so callers always see the current version.
+- `library_get_control` returns a `LibraryControlDetail` with related risks, framework mappings, and test procedures inline — one round-trip per detail view.
+
+**UI** (`app/src/lib/routes/Library.svelte`):
+- List/detail toggle with tabs for Controls / Risks. Filters: framework dropdown, system-type dropdown, keyword input. Detail view shows objective, description, pill row (type / frequency / system types), framework mappings, related risks, and test procedures with numbered steps plus evidence checklists.
+- `prettySystemType()` maps bundle codes (`generic-erp`, `core-banking`) to display strings.
+
+**Verified**:
+- `cargo test` — 25 passing (5 new library tests).
+- `svelte-check` — 91 files, 0 errors, 0 warnings.
+- `npm run build` — 81.62 kB JS / 21.60 kB CSS.
+
+**Deliberately out of scope**:
+- **Firm overrides**. Schema (`FirmOverride` keyed by `code + library_version`) is already in place from migration 0006; UI comes later.
+- **Updating library in-app**. Baseline is compiled in. A later flow will let firms drop a new signed bundle into a watched directory. Loader already handles the upgrade path.
+- **Test procedure browsing as a standalone list**. Procedures are viewed nested under their control. Can promote to a top-level list if the UX demands it.
 
 ### 2026-04-21 — SQLCipher keying wired
 

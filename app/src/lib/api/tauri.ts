@@ -50,6 +50,57 @@ export interface LibraryVersion {
   frameworks: string[];
 }
 
+export interface LibraryRiskSummary {
+  id: string;
+  code: string;
+  title: string;
+  default_inherent_rating: string | null;
+  applicable_system_types: string[];
+}
+
+export interface LibraryControlSummary {
+  id: string;
+  code: string;
+  title: string;
+  objective: string;
+  control_type: string;
+  frequency: string | null;
+  applicable_system_types: string[];
+  frameworks: string[];
+  test_procedure_count: number;
+}
+
+export interface LibraryFrameworkMapping {
+  framework: string;
+  reference: string;
+}
+
+export interface LibraryTestProcedureSummary {
+  id: string;
+  code: string;
+  name: string;
+  objective: string;
+  steps: string[];
+  sampling_default: string;
+  automation_hint: string;
+  evidence_checklist: string[];
+}
+
+export interface LibraryControlDetail {
+  id: string;
+  code: string;
+  title: string;
+  description: string;
+  objective: string;
+  control_type: string;
+  frequency: string | null;
+  applicable_system_types: string[];
+  related_risks: LibraryRiskSummary[];
+  framework_mappings: LibraryFrameworkMapping[];
+  test_procedures: LibraryTestProcedureSummary[];
+  library_version: string;
+}
+
 export interface CurrentUser {
   signed_in: boolean;
   display_name: string | null;
@@ -132,4 +183,9 @@ export const api = {
   createEngagement: (input: NewEngagementInput) =>
     invoke<EngagementSummary>("create_engagement", { input }),
   libraryVersion: () => invoke<LibraryVersion>("library_version"),
+  libraryListRisks: () => invoke<LibraryRiskSummary[]>("library_list_risks"),
+  libraryListControls: () =>
+    invoke<LibraryControlSummary[]>("library_list_controls"),
+  libraryGetControl: (id: string) =>
+    invoke<LibraryControlDetail>("library_get_control", { id }),
 };

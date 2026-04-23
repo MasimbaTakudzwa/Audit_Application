@@ -8,6 +8,7 @@ mod commands;
 mod crypto;
 mod db;
 mod error;
+mod library;
 mod models;
 mod paths;
 
@@ -58,6 +59,9 @@ pub fn run() {
             commands::engagements::list_engagements,
             commands::engagements::create_engagement,
             commands::library::library_version,
+            commands::library::library_list_risks,
+            commands::library::library_list_controls,
+            commands::library::library_get_control,
         ])
         .run(tauri::generate_context!())
         .expect("failed to launch audit application");

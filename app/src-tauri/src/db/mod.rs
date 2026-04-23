@@ -31,14 +31,15 @@ impl DbState {
     }
 
     /// Opens the SQLCipher DB at `path` using `master_key` as the page key,
-    /// applies pragmas, runs migrations, and stores the connection.
+    /// applies pragmas, runs migrations, installs any shipped library
+    /// bundles, and stores the connection.
     ///
     /// The `PRAGMA key` statement MUST be the first thing run on the
     /// connection — SQLCipher rejects keying after any other access. Using
     /// `execute_batch` with the raw-key blob literal avoids any quoting
     /// surprises from rusqlite's `pragma_update` code path.
     pub fn open_with_key(&self, path: &Path, master_key: &[u8; 32]) -> AppResult<()> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
 
         let key_literal = format!("PRAGMA key = \"x'{}'\";", hex::encode(master_key));
         conn.execute_batch(&key_literal)?;
@@ -61,6 +62,7 @@ impl DbState {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
 
         migrations::run(&conn)?;
+        crate::library::loader::install_baseline_bundles(&mut conn)?;
 
         *self.inner.lock() = Some(conn);
         Ok(())

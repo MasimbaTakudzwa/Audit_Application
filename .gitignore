@@ -25,6 +25,7 @@ app/src-tauri/target/
 app/src-tauri/gen/
 app/src-tauri/WixTools/
 app/src-tauri/capabilities/.generated.json
+tools/**/target/
 
 # Local app data never checked in
 audit.db
