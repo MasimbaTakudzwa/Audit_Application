@@ -68,7 +68,7 @@ pub fn run() {
             commands::testing::engagement_upload_data_import,
             commands::testing::engagement_list_data_imports,
             commands::testing::engagement_list_tests,
-            commands::testing::engagement_run_access_review,
+            commands::testing::engagement_run_matcher,
             commands::testing::engagement_list_test_results,
             commands::findings::engagement_elevate_finding,
             commands::findings::engagement_update_finding,

@@ -17,7 +17,16 @@
     openEngagement,
   } from "../stores/router";
 
-  const MATCHER_ENABLED_CODES = new Set(["UAM-T-001", "UAM-T-003"]);
+  const MATCHER_ENABLED_CODES = new Set([
+    "UAM-T-001",
+    "UAM-T-003",
+    "UAM-T-004",
+    "CHG-T-001",
+    "CHG-T-002",
+    "BKP-T-001",
+    "ITAC-T-001",
+    "ITAC-T-002",
+  ]);
 
   let loading = $state(true);
   let err = $state("");
@@ -129,10 +138,9 @@
     runningMatcher = true;
     runErr = "";
     try {
-      await api.engagementRunAccessReview({
+      await api.engagementRunMatcher({
         test_id: test.id,
-        ad_import_id: null,
-        leavers_import_id: null,
+        overrides: null,
       });
       await load(engagement.id);
     } catch (e) {

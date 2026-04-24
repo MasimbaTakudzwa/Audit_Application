@@ -23,6 +23,7 @@
 //!     `ChangeLog` entry (`field_name = "."` per `DATA_MODEL.md`). One
 //!     `ActivityLog` entry summarises the clone.
 
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, OptionalExtension};
@@ -36,7 +37,10 @@ use crate::{
     blobs,
     db::DbState,
     error::{AppError, AppResult},
-    matcher::{access_review, csv as csv_parser},
+    matcher::{
+        access_review, backup, change_management, csv as csv_parser, itac_benford,
+        itac_duplicates,
+    },
     paths::AppPaths,
 };
 
@@ -100,33 +104,75 @@ pub struct TestSummary {
     pub latest_result_evidence_count: Option<i64>,
 }
 
+/// Input for the generic matcher dispatcher. One endpoint for every rule
+/// family — the rule to run is derived from the test code.
+///
+/// `overrides` is a free-form `purpose_tag -> DataImport.id` map. The UI
+/// normally passes `None`, letting the matcher pick the newest import for
+/// each required purpose tag. Advanced callers can pin a specific import —
+/// useful for reproducing a prior run, or when multiple candidate imports
+/// of the same purpose tag exist for an engagement.
 #[derive(Debug, Deserialize)]
-pub struct RunAccessReviewInput {
+pub struct RunMatcherInput {
     pub test_id: String,
-    pub ad_import_id: Option<String>,
-    pub leavers_import_id: Option<String>,
+    #[serde(default)]
+    pub overrides: Option<HashMap<String, String>>,
 }
 
+/// Result of a matcher run. Fields come in three bands:
+/// 1. Always present: `test_result_id`, `rule`, `outcome`, `exception_count`,
+///    `primary_import_id`, `primary_import_filename`.
+/// 2. Family-specific counters (UAR / CHG / BKP), each `Option<i64>` —
+///    populated only for the rule that owns them.
+/// 3. Optional `supporting_import_id` / `supporting_import_filename` for
+///    rules that need a second input (today: terminated-but-active).
 #[derive(Debug, Serialize)]
-pub struct AccessReviewRunResult {
+pub struct MatcherRunResult {
     pub test_result_id: String,
     pub rule: String,
     pub outcome: String,
     pub exception_count: i64,
-    pub ad_import_id: String,
-    pub ad_import_filename: Option<String>,
-    pub ad_rows_considered: i64,
-    pub ad_rows_skipped_disabled: i64,
-    /// Present for terminated-but-active (the HR leavers input); absent for
-    /// dormant-accounts which has no leavers input.
-    pub leavers_import_id: Option<String>,
-    pub leavers_import_filename: Option<String>,
+    pub primary_import_id: String,
+    pub primary_import_filename: Option<String>,
+    pub supporting_import_id: Option<String>,
+    pub supporting_import_filename: Option<String>,
+    // --- User access review family ---
+    pub ad_rows_considered: Option<i64>,
+    pub ad_rows_skipped_disabled: Option<i64>,
     pub leaver_rows_considered: Option<i64>,
+    pub hr_rows_considered: Option<i64>,
     pub ad_rows_skipped_unmatchable: Option<i64>,
-    /// Present for dormant-accounts only.
     pub ad_rows_skipped_no_last_logon: Option<i64>,
     pub ad_rows_skipped_unparseable: Option<i64>,
     pub dormancy_threshold_days: Option<i64>,
+    // --- Change management family ---
+    pub changes_considered: Option<i64>,
+    pub changes_skipped_standard: Option<i64>,
+    pub changes_skipped_cancelled: Option<i64>,
+    pub changes_skipped_not_deployed: Option<i64>,
+    pub changes_skipped_no_id: Option<i64>,
+    pub changes_skipped_unparseable_dates: Option<i64>,
+    // CHG SoD (dev-vs-deploy) — two permission-list inputs, not a change log.
+    pub deploy_rows_considered: Option<i64>,
+    pub deploy_rows_skipped_unmatchable: Option<i64>,
+    pub source_rows_considered: Option<i64>,
+    pub source_rows_skipped_unmatchable: Option<i64>,
+    pub intersecting_users: Option<i64>,
+    // --- Backup family ---
+    pub jobs_considered: Option<i64>,
+    pub jobs_skipped_no_id: Option<i64>,
+    pub jobs_skipped_unknown_status: Option<i64>,
+    // --- IT application controls family ---
+    pub transactions_considered: Option<i64>,
+    pub transactions_skipped_unparseable: Option<i64>,
+    pub transactions_skipped_zero: Option<i64>,
+    pub digit_rows_evaluated: Option<i64>,
+    // Duplicate-transaction detection (ITAC-T-002) adds three more counters.
+    // `rows_skipped_no_key` covers rows that had a parseable non-zero amount
+    // but no counterparty or no date — they can't be grouped without a key.
+    pub transactions_skipped_no_key: Option<i64>,
+    pub duplicate_group_count: Option<i64>,
+    pub total_duplicate_rows: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -615,13 +661,13 @@ pub fn engagement_list_tests(
 }
 
 #[tauri::command]
-pub fn engagement_run_access_review(
-    input: RunAccessReviewInput,
+pub fn engagement_run_matcher(
+    input: RunMatcherInput,
     db: State<'_, DbState>,
     auth: State<'_, AuthState>,
     paths: State<'_, AppPaths>,
-) -> AppResult<AccessReviewRunResult> {
-    run_access_review(db.inner(), auth.inner(), paths.inner(), input)
+) -> AppResult<MatcherRunResult> {
+    run_matcher(db.inner(), auth.inner(), paths.inner(), input)
 }
 
 #[tauri::command]
@@ -980,27 +1026,35 @@ pub(crate) fn list_tests(
     })
 }
 
-pub(crate) fn run_access_review(
+pub(crate) fn run_matcher(
     db: &DbState,
     auth: &AuthState,
     paths: &AppPaths,
-    input: RunAccessReviewInput,
-) -> AppResult<AccessReviewRunResult> {
+    input: RunMatcherInput,
+) -> AppResult<MatcherRunResult> {
     let (session, master_key) = auth.require_keyed()?;
     let test_id = input.test_id.trim().to_string();
     if test_id.is_empty() {
         return Err(AppError::Message("test is required".into()));
     }
-    let ad_import_override = input
-        .ad_import_id
-        .as_ref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let leavers_import_override = input
-        .leavers_import_id
-        .as_ref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+
+    // Normalise overrides: trim keys and values, drop entries that become
+    // empty. The UI normally passes `None`; advanced callers can pin a
+    // specific `DataImport.id` per purpose tag.
+    let overrides: HashMap<String, String> = input
+        .overrides
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let k = k.trim().to_string();
+            let v = v.trim().to_string();
+            if k.is_empty() || v.is_empty() {
+                None
+            } else {
+                Some((k, v))
+            }
+        })
+        .collect();
 
     let now = now_secs();
 
@@ -1043,149 +1097,47 @@ pub(crate) fn run_access_review(
             return Err(AppError::NotFound("test not found".into()));
         }
 
-        let rule = AccessReviewRule::for_test_code(&test.code)?;
+        let rule = MatcherRule::for_test_code(&test.code)?;
 
-        let ad_import = resolve_import(
-            &tx,
-            &engagement_id,
-            ad_import_override.as_deref(),
-            &["ad_export", "entra_export"],
-            "AD or Entra export",
-        )?;
-        let ad_blob_id = ad_import
-            .blob_id
-            .clone()
-            .ok_or_else(|| AppError::Message("AD export has no attached file".into()))?;
-        let ad_bytes = blobs::read_blob(&tx, &paths.app_data_dir, &ad_blob_id, &master_key)?;
-        let ad_text = std::str::from_utf8(&ad_bytes)
-            .map_err(|e| AppError::Message(format!("AD export is not valid UTF-8: {e}")))?;
-        let ad_table = csv_parser::parse(ad_text)?;
-
-        // Per-rule dispatch. Each branch produces a `RuleOutcome` carrying
-        // everything downstream needs: the report JSON to persist, the
-        // exception counts, the detail payload, and any rule-specific extras
-        // for the return value.
+        // Per-rule dispatch. Each branch resolves its own imports, reads the
+        // encrypted blobs, parses the CSVs, calls the pure matcher, and
+        // produces a `RuleOutcome` the shared persistence path below consumes.
         let outcome = match rule {
-            AccessReviewRule::TerminatedButActive => {
-                let leavers_import = resolve_import(
-                    &tx,
-                    &engagement_id,
-                    leavers_import_override.as_deref(),
-                    &["hr_leavers"],
-                    "HR leavers list",
-                )?;
-                let leavers_blob_id = leavers_import.blob_id.clone().ok_or_else(|| {
-                    AppError::Message("HR leavers list has no attached file".into())
-                })?;
-                let leavers_bytes = blobs::read_blob(
-                    &tx,
-                    &paths.app_data_dir,
-                    &leavers_blob_id,
-                    &master_key,
-                )?;
-                let leavers_text = std::str::from_utf8(&leavers_bytes).map_err(|e| {
-                    AppError::Message(format!("HR leavers list is not valid UTF-8: {e}"))
-                })?;
-                let leavers_table = csv_parser::parse(leavers_text)?;
-                let report =
-                    access_review::run_terminated_but_active(&ad_table, &leavers_table);
-
-                let exception_count = report.exceptions.len() as i64;
-                let summary = if exception_count == 0 {
-                    format!(
-                        "No terminated users still enabled across {} AD rows and {} leaver rows",
-                        report.ad_rows_considered, report.leaver_rows_considered
-                    )
-                } else {
-                    format!(
-                        "{} terminated user{} still enabled in AD",
-                        exception_count,
-                        if exception_count == 1 { "" } else { "s" }
-                    )
-                };
-                let detail = json!({
-                    "rule": report.rule,
-                    "ad_import_id": ad_import.id,
-                    "leavers_import_id": leavers_import.id,
-                    "ad_rows_considered": report.ad_rows_considered,
-                    "leaver_rows_considered": report.leaver_rows_considered,
-                    "ad_rows_skipped_disabled": report.ad_rows_skipped_disabled,
-                    "ad_rows_skipped_unmatchable": report.ad_rows_skipped_unmatchable,
-                })
-                .to_string();
-                let report_json = serde_json::to_vec_pretty(&report)?;
-
-                RuleOutcome {
-                    rule: report.rule.clone(),
-                    report_json,
-                    exception_count,
-                    exception_summary: summary,
-                    detail_json: detail,
-                    ad_rows_considered: report.ad_rows_considered as i64,
-                    ad_rows_skipped_disabled: report.ad_rows_skipped_disabled as i64,
-                    leavers_import: Some(leavers_import),
-                    leaver_rows_considered: Some(report.leaver_rows_considered as i64),
-                    ad_rows_skipped_unmatchable: Some(report.ad_rows_skipped_unmatchable as i64),
-                    ad_rows_skipped_no_last_logon: None,
-                    ad_rows_skipped_unparseable: None,
-                    dormancy_threshold_days: None,
-                }
+            MatcherRule::UarTerminatedButActive => {
+                run_uar_terminated_but_active(&tx, paths, &engagement_id, &master_key, &overrides)?
             }
-            AccessReviewRule::DormantAccounts => {
-                let threshold_days = access_review::DORMANT_THRESHOLD_DAYS_DEFAULT;
-                let report =
-                    access_review::run_dormant_accounts(&ad_table, now, threshold_days);
-
-                let exception_count = report.exceptions.len() as i64;
-                let summary = if exception_count == 0 {
-                    format!(
-                        "No dormant accounts across {} AD rows at a {}-day threshold",
-                        report.ad_rows_considered, threshold_days
-                    )
-                } else {
-                    format!(
-                        "{} dormant account{} exceeding the {}-day threshold",
-                        exception_count,
-                        if exception_count == 1 { "" } else { "s" },
-                        threshold_days
-                    )
-                };
-                let detail = json!({
-                    "rule": report.rule,
-                    "ad_import_id": ad_import.id,
-                    "ad_rows_considered": report.ad_rows_considered,
-                    "ad_rows_skipped_disabled": report.ad_rows_skipped_disabled,
-                    "ad_rows_skipped_no_last_logon": report.ad_rows_skipped_no_last_logon,
-                    "ad_rows_skipped_unparseable": report.ad_rows_skipped_unparseable,
-                    "threshold_days": report.threshold_days,
-                    "as_of_secs": report.as_of_secs,
-                })
-                .to_string();
-                let report_json = serde_json::to_vec_pretty(&report)?;
-
-                RuleOutcome {
-                    rule: report.rule.clone(),
-                    report_json,
-                    exception_count,
-                    exception_summary: summary,
-                    detail_json: detail,
-                    ad_rows_considered: report.ad_rows_considered as i64,
-                    ad_rows_skipped_disabled: report.ad_rows_skipped_disabled as i64,
-                    leavers_import: None,
-                    leaver_rows_considered: None,
-                    ad_rows_skipped_unmatchable: None,
-                    ad_rows_skipped_no_last_logon: Some(
-                        report.ad_rows_skipped_no_last_logon as i64,
-                    ),
-                    ad_rows_skipped_unparseable: Some(
-                        report.ad_rows_skipped_unparseable as i64,
-                    ),
-                    dormancy_threshold_days: Some(report.threshold_days as i64),
-                }
+            MatcherRule::UarDormantAccounts => {
+                run_uar_dormant_accounts(&tx, paths, &engagement_id, &master_key, &overrides, now)?
             }
+            MatcherRule::UarOrphanAccounts => {
+                run_uar_orphan_accounts(&tx, paths, &engagement_id, &master_key, &overrides)?
+            }
+            MatcherRule::ChgApprovalBeforeDeployment => run_chg_approval_before_deployment(
+                &tx,
+                paths,
+                &engagement_id,
+                &master_key,
+                &overrides,
+            )?,
+            MatcherRule::ChgSodDevVsDeploy => {
+                run_chg_sod_dev_vs_deploy(&tx, paths, &engagement_id, &master_key, &overrides)?
+            }
+            MatcherRule::BkpPerformance => {
+                run_bkp_performance(&tx, paths, &engagement_id, &master_key, &overrides)?
+            }
+            MatcherRule::ItacBenfordFirstDigit => {
+                run_itac_benford_first_digit(&tx, paths, &engagement_id, &master_key, &overrides)?
+            }
+            MatcherRule::ItacDuplicateTransactions => run_itac_duplicate_transactions(
+                &tx,
+                paths,
+                &engagement_id,
+                &master_key,
+                &overrides,
+            )?,
         };
 
-        let report_filename = format!("access-review-{}.json", &test.code);
+        let report_filename = format!("{}-{}.json", outcome.report_kind_slug, &test.code);
         let written_report = blobs::write_engagement_blob(
             &tx,
             &paths.app_data_dir,
@@ -1203,9 +1155,16 @@ pub(crate) fn run_access_review(
         let result_outcome = if exception_count == 0 { "pass" } else { "exception" };
         let exception_summary = outcome.exception_summary.clone();
         let detail_json = outcome.detail_json.clone();
+        let primary_blob_id = outcome.primary_import.blob_id.clone().ok_or_else(|| {
+            AppError::Message(format!(
+                "{} has no attached file",
+                outcome.primary_import_label
+            ))
+        })?;
         let population_label = format!(
-            "AD export: {}",
-            ad_import.filename.as_deref().unwrap_or("(unnamed)")
+            "{}: {}",
+            outcome.primary_import_label,
+            outcome.primary_import.filename.as_deref().unwrap_or("(unnamed)")
         );
 
         let test_result_id = Uuid::now_v7().to_string();
@@ -1224,7 +1183,7 @@ pub(crate) fn run_access_review(
                 session.user_id,
                 now,
                 written_report.id,
-                ad_blob_id,
+                primary_blob_id,
                 population_label,
                 detail_json,
             ],
@@ -1254,7 +1213,7 @@ pub(crate) fn run_access_review(
                     "exception_summary": exception_summary,
                     "evidence_count": exception_count,
                     "notes_blob_id": written_report.id,
-                    "population_ref": ad_blob_id,
+                    "population_ref": primary_blob_id,
                 })
                 .to_string(),
             ],
@@ -1310,8 +1269,8 @@ pub(crate) fn run_access_review(
                 session.user_id,
                 now,
                 format!(
-                    "Access review matcher on {}: {}",
-                    test.code, exception_summary
+                    "{} matcher on {}: {}",
+                    outcome.family_label, test.code, exception_summary
                 ),
             ],
         )?;
@@ -1352,27 +1311,27 @@ pub(crate) fn run_access_review(
         // Link the source DataImports' Evidence rows to the test so they show
         // up as supporting evidence (relevance = 'supporting'). The primary
         // evidence for this test is the matcher_report row just created.
-        let ad_evidence_id: Option<String> = tx
+        let primary_evidence_id: Option<String> = tx
             .query_row(
                 "SELECT id FROM Evidence WHERE data_import_id = ?1",
-                params![ad_import.id],
+                params![outcome.primary_import.id],
                 |r| r.get(0),
             )
             .optional()?;
-        if let Some(eid) = ad_evidence_id {
+        if let Some(eid) = primary_evidence_id {
             crate::commands::evidence::link_evidence_to_test(
                 &tx, &test.id, &eid, "supporting", now,
             )?;
         }
-        if let Some(li) = outcome.leavers_import.as_ref() {
-            let leavers_evidence_id: Option<String> = tx
+        if let Some(si) = outcome.supporting_import.as_ref() {
+            let supporting_evidence_id: Option<String> = tx
                 .query_row(
                     "SELECT id FROM Evidence WHERE data_import_id = ?1",
-                    params![li.id],
+                    params![si.id],
                     |r| r.get(0),
                 )
                 .optional()?;
-            if let Some(eid) = leavers_evidence_id {
+            if let Some(eid) = supporting_evidence_id {
                 crate::commands::evidence::link_evidence_to_test(
                     &tx, &test.id, &eid, "supporting", now,
                 )?;
@@ -1388,70 +1347,907 @@ pub(crate) fn run_access_review(
             rule = %outcome.rule,
             outcome = %result_outcome,
             exception_count,
-            "access review matcher ran"
+            "matcher ran"
         );
 
-        let (leavers_import_id, leavers_import_filename) = outcome
-            .leavers_import
+        let (supporting_import_id, supporting_import_filename) = outcome
+            .supporting_import
             .as_ref()
-            .map(|li| (Some(li.id.clone()), li.filename.clone()))
+            .map(|si| (Some(si.id.clone()), si.filename.clone()))
             .unwrap_or((None, None));
 
-        Ok(AccessReviewRunResult {
+        Ok(MatcherRunResult {
             test_result_id,
             rule: outcome.rule.clone(),
             outcome: result_outcome.to_string(),
             exception_count,
-            ad_import_id: ad_import.id,
-            ad_import_filename: ad_import.filename,
-            leavers_import_id,
-            leavers_import_filename,
+            primary_import_id: outcome.primary_import.id,
+            primary_import_filename: outcome.primary_import.filename,
+            supporting_import_id,
+            supporting_import_filename,
             ad_rows_considered: outcome.ad_rows_considered,
-            leaver_rows_considered: outcome.leaver_rows_considered,
             ad_rows_skipped_disabled: outcome.ad_rows_skipped_disabled,
+            leaver_rows_considered: outcome.leaver_rows_considered,
+            hr_rows_considered: outcome.hr_rows_considered,
             ad_rows_skipped_unmatchable: outcome.ad_rows_skipped_unmatchable,
             ad_rows_skipped_no_last_logon: outcome.ad_rows_skipped_no_last_logon,
             ad_rows_skipped_unparseable: outcome.ad_rows_skipped_unparseable,
             dormancy_threshold_days: outcome.dormancy_threshold_days,
+            changes_considered: outcome.changes_considered,
+            changes_skipped_standard: outcome.changes_skipped_standard,
+            changes_skipped_cancelled: outcome.changes_skipped_cancelled,
+            changes_skipped_not_deployed: outcome.changes_skipped_not_deployed,
+            changes_skipped_no_id: outcome.changes_skipped_no_id,
+            changes_skipped_unparseable_dates: outcome.changes_skipped_unparseable_dates,
+            deploy_rows_considered: outcome.deploy_rows_considered,
+            deploy_rows_skipped_unmatchable: outcome.deploy_rows_skipped_unmatchable,
+            source_rows_considered: outcome.source_rows_considered,
+            source_rows_skipped_unmatchable: outcome.source_rows_skipped_unmatchable,
+            intersecting_users: outcome.intersecting_users,
+            jobs_considered: outcome.jobs_considered,
+            jobs_skipped_no_id: outcome.jobs_skipped_no_id,
+            jobs_skipped_unknown_status: outcome.jobs_skipped_unknown_status,
+            transactions_considered: outcome.transactions_considered,
+            transactions_skipped_unparseable: outcome.transactions_skipped_unparseable,
+            transactions_skipped_zero: outcome.transactions_skipped_zero,
+            digit_rows_evaluated: outcome.digit_rows_evaluated,
+            transactions_skipped_no_key: outcome.transactions_skipped_no_key,
+            duplicate_group_count: outcome.duplicate_group_count,
+            total_duplicate_rows: outcome.total_duplicate_rows,
         })
     })
 }
 
-/// Which rule the UAR matcher should run for a given test code. Dispatch lives
-/// here so the command layer has a single point to reject tests whose code is
-/// not wired up (e.g. attempting to run the matcher on a CHG-* test).
+/// Which matcher rule to run for a given test code. Dispatch lives here so
+/// the command layer has a single point to reject tests whose code is not
+/// wired up to a matcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AccessReviewRule {
-    TerminatedButActive,
-    DormantAccounts,
+enum MatcherRule {
+    UarTerminatedButActive,
+    UarDormantAccounts,
+    UarOrphanAccounts,
+    ChgApprovalBeforeDeployment,
+    ChgSodDevVsDeploy,
+    BkpPerformance,
+    ItacBenfordFirstDigit,
+    ItacDuplicateTransactions,
 }
 
-impl AccessReviewRule {
+impl MatcherRule {
     fn for_test_code(code: &str) -> AppResult<Self> {
         match code {
-            "UAM-T-001" => Ok(Self::TerminatedButActive),
-            "UAM-T-003" => Ok(Self::DormantAccounts),
+            "UAM-T-001" => Ok(Self::UarTerminatedButActive),
+            "UAM-T-003" => Ok(Self::UarDormantAccounts),
+            "UAM-T-004" => Ok(Self::UarOrphanAccounts),
+            "CHG-T-001" => Ok(Self::ChgApprovalBeforeDeployment),
+            "CHG-T-002" => Ok(Self::ChgSodDevVsDeploy),
+            "BKP-T-001" => Ok(Self::BkpPerformance),
+            "ITAC-T-001" => Ok(Self::ItacBenfordFirstDigit),
+            "ITAC-T-002" => Ok(Self::ItacDuplicateTransactions),
             other => Err(AppError::Message(format!(
-                "no access review rule is wired for test code {other}"
+                "no matcher is wired for test code {other}"
             ))),
         }
     }
 }
 
+/// What each per-rule branch produces. Most fields are optional because they
+/// are specific to one rule family; the shared persistence path reads only
+/// the fields it needs for that run.
 struct RuleOutcome {
     rule: String,
+    /// Human-readable family label used in the ActivityLog summary. One of
+    /// "User access review", "Change management", "Backup".
+    family_label: String,
+    /// Slug used to name the persisted report blob, e.g.
+    /// `access-review-UAM-T-001.json`.
+    report_kind_slug: String,
     report_json: Vec<u8>,
     exception_count: i64,
     exception_summary: String,
     detail_json: String,
-    ad_rows_considered: i64,
-    ad_rows_skipped_disabled: i64,
-    leavers_import: Option<ImportRef>,
+    /// The `DataImport` used as the primary population for the test. Its
+    /// blob id goes into `TestResult.population_ref`.
+    primary_import: ImportRef,
+    /// Human-readable label for the primary import, e.g. "AD export" or
+    /// "Change log", used in the `TestResult.population_ref_label`.
+    primary_import_label: String,
+    /// A second input, if the rule needs one. Terminated-but-active uses
+    /// this for the HR leavers list; the other rules leave it `None`.
+    supporting_import: Option<ImportRef>,
+    // --- UAR counters ---
+    ad_rows_considered: Option<i64>,
+    ad_rows_skipped_disabled: Option<i64>,
     leaver_rows_considered: Option<i64>,
     ad_rows_skipped_unmatchable: Option<i64>,
     ad_rows_skipped_no_last_logon: Option<i64>,
     ad_rows_skipped_unparseable: Option<i64>,
     dormancy_threshold_days: Option<i64>,
+    /// Orphan-accounts rule only: size of the HR master roster used for the
+    /// membership check. Separate from `leaver_rows_considered` because it
+    /// carries different semantics (active employees vs known terminations).
+    hr_rows_considered: Option<i64>,
+    // --- CHG counters ---
+    changes_considered: Option<i64>,
+    changes_skipped_standard: Option<i64>,
+    changes_skipped_cancelled: Option<i64>,
+    changes_skipped_not_deployed: Option<i64>,
+    changes_skipped_no_id: Option<i64>,
+    changes_skipped_unparseable_dates: Option<i64>,
+    // CHG SoD (dev-vs-deploy) counters. Separate from the change-log counters
+    // above because this rule consumes two permission exports, not a change
+    // register — the auditor reads this block when interpreting a CHG-T-002
+    // result.
+    deploy_rows_considered: Option<i64>,
+    deploy_rows_skipped_unmatchable: Option<i64>,
+    source_rows_considered: Option<i64>,
+    source_rows_skipped_unmatchable: Option<i64>,
+    /// Count of users appearing in both the deploy-permission export and the
+    /// source-repo access export. Equal to the SoD exception count.
+    intersecting_users: Option<i64>,
+    // --- BKP counters ---
+    jobs_considered: Option<i64>,
+    jobs_skipped_no_id: Option<i64>,
+    jobs_skipped_unknown_status: Option<i64>,
+    // --- ITAC counters ---
+    transactions_considered: Option<i64>,
+    transactions_skipped_unparseable: Option<i64>,
+    transactions_skipped_zero: Option<i64>,
+    /// Count of transactions whose leading digit actually made it into the
+    /// Benford distribution calculation. `transactions_considered` minus
+    /// the skipped buckets. Auditors compare this against `min_digit_rows`
+    /// to know whether the test was run at full strength.
+    digit_rows_evaluated: Option<i64>,
+    /// Duplicate-transaction rule: rows that parsed a non-zero amount but
+    /// had no counterparty or no date, so couldn't be assigned a grouping
+    /// key. Recorded so the auditor sees how many rows never entered the
+    /// duplicate-detection step.
+    transactions_skipped_no_key: Option<i64>,
+    /// Duplicate-transaction rule: number of groups of 2+ rows sharing the
+    /// same `(amount, counterparty, date)` key. Equal to
+    /// `exception_count` for this rule.
+    duplicate_group_count: Option<i64>,
+    /// Duplicate-transaction rule: total rows across all flagged groups.
+    /// Always `>= duplicate_group_count * 2`.
+    total_duplicate_rows: Option<i64>,
+}
+
+impl RuleOutcome {
+    /// All optional counters default to `None`. Each per-rule branch fills in
+    /// only the fields relevant to its family.
+    fn base(
+        rule: String,
+        family_label: &str,
+        report_kind_slug: &str,
+        report_json: Vec<u8>,
+        exception_count: i64,
+        exception_summary: String,
+        detail_json: String,
+        primary_import: ImportRef,
+        primary_import_label: &str,
+    ) -> Self {
+        Self {
+            rule,
+            family_label: family_label.to_string(),
+            report_kind_slug: report_kind_slug.to_string(),
+            report_json,
+            exception_count,
+            exception_summary,
+            detail_json,
+            primary_import,
+            primary_import_label: primary_import_label.to_string(),
+            supporting_import: None,
+            ad_rows_considered: None,
+            ad_rows_skipped_disabled: None,
+            leaver_rows_considered: None,
+            ad_rows_skipped_unmatchable: None,
+            ad_rows_skipped_no_last_logon: None,
+            ad_rows_skipped_unparseable: None,
+            dormancy_threshold_days: None,
+            hr_rows_considered: None,
+            changes_considered: None,
+            changes_skipped_standard: None,
+            changes_skipped_cancelled: None,
+            changes_skipped_not_deployed: None,
+            changes_skipped_no_id: None,
+            changes_skipped_unparseable_dates: None,
+            deploy_rows_considered: None,
+            deploy_rows_skipped_unmatchable: None,
+            source_rows_considered: None,
+            source_rows_skipped_unmatchable: None,
+            intersecting_users: None,
+            jobs_considered: None,
+            jobs_skipped_no_id: None,
+            jobs_skipped_unknown_status: None,
+            transactions_considered: None,
+            transactions_skipped_unparseable: None,
+            transactions_skipped_zero: None,
+            digit_rows_evaluated: None,
+            transactions_skipped_no_key: None,
+            duplicate_group_count: None,
+            total_duplicate_rows: None,
+        }
+    }
+}
+
+/// Load an encrypted CSV blob as a parsed `Table`. Wraps the decrypt + UTF-8
+/// check + parser into one fallible step per import. `label` appears in the
+/// error message if the bytes aren't UTF-8.
+fn load_csv_table(
+    tx: &rusqlite::Transaction<'_>,
+    paths: &AppPaths,
+    master_key: &[u8; 32],
+    import: &ImportRef,
+    label: &str,
+) -> AppResult<csv_parser::Table> {
+    let blob_id = import
+        .blob_id
+        .clone()
+        .ok_or_else(|| AppError::Message(format!("{label} has no attached file")))?;
+    let bytes = blobs::read_blob(tx, &paths.app_data_dir, &blob_id, master_key)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|e| AppError::Message(format!("{label} is not valid UTF-8: {e}")))?;
+    csv_parser::parse(text)
+}
+
+/// UAR terminated-but-active: AD + HR leavers list → exceptions where a
+/// terminated user still has an enabled account.
+fn run_uar_terminated_but_active(
+    tx: &rusqlite::Transaction<'_>,
+    paths: &AppPaths,
+    engagement_id: &str,
+    master_key: &[u8; 32],
+    overrides: &HashMap<String, String>,
+) -> AppResult<RuleOutcome> {
+    let ad_override = overrides
+        .get("ad_export")
+        .or_else(|| overrides.get("entra_export"))
+        .or_else(|| overrides.get("primary"))
+        .map(String::as_str);
+    let ad_import = resolve_import(
+        tx,
+        engagement_id,
+        ad_override,
+        &["ad_export", "entra_export"],
+        "AD or Entra export",
+    )?;
+    let ad_table = load_csv_table(tx, paths, master_key, &ad_import, "AD export")?;
+
+    let leavers_override = overrides
+        .get("hr_leavers")
+        .or_else(|| overrides.get("supporting"))
+        .map(String::as_str);
+    let leavers_import = resolve_import(
+        tx,
+        engagement_id,
+        leavers_override,
+        &["hr_leavers"],
+        "HR leavers list",
+    )?;
+    let leavers_table =
+        load_csv_table(tx, paths, master_key, &leavers_import, "HR leavers list")?;
+
+    let report = access_review::run_terminated_but_active(&ad_table, &leavers_table);
+    let exception_count = report.exceptions.len() as i64;
+    let summary = if exception_count == 0 {
+        format!(
+            "No terminated users still enabled across {} AD rows and {} leaver rows",
+            report.ad_rows_considered, report.leaver_rows_considered
+        )
+    } else {
+        format!(
+            "{} terminated user{} still enabled in AD",
+            exception_count,
+            if exception_count == 1 { "" } else { "s" }
+        )
+    };
+    let detail = json!({
+        "rule": report.rule,
+        "ad_import_id": ad_import.id,
+        "leavers_import_id": leavers_import.id,
+        "ad_rows_considered": report.ad_rows_considered,
+        "leaver_rows_considered": report.leaver_rows_considered,
+        "ad_rows_skipped_disabled": report.ad_rows_skipped_disabled,
+        "ad_rows_skipped_unmatchable": report.ad_rows_skipped_unmatchable,
+    })
+    .to_string();
+    let report_json = serde_json::to_vec_pretty(&report)?;
+
+    let mut outcome = RuleOutcome::base(
+        report.rule.clone(),
+        "User access review",
+        "access-review",
+        report_json,
+        exception_count,
+        summary,
+        detail,
+        ad_import,
+        "AD export",
+    );
+    outcome.supporting_import = Some(leavers_import);
+    outcome.ad_rows_considered = Some(report.ad_rows_considered as i64);
+    outcome.ad_rows_skipped_disabled = Some(report.ad_rows_skipped_disabled as i64);
+    outcome.leaver_rows_considered = Some(report.leaver_rows_considered as i64);
+    outcome.ad_rows_skipped_unmatchable = Some(report.ad_rows_skipped_unmatchable as i64);
+    Ok(outcome)
+}
+
+/// UAR dormant-accounts: AD only → exceptions for enabled accounts whose
+/// last logon is older than the configured threshold.
+fn run_uar_dormant_accounts(
+    tx: &rusqlite::Transaction<'_>,
+    paths: &AppPaths,
+    engagement_id: &str,
+    master_key: &[u8; 32],
+    overrides: &HashMap<String, String>,
+    now: i64,
+) -> AppResult<RuleOutcome> {
+    let ad_override = overrides
+        .get("ad_export")
+        .or_else(|| overrides.get("entra_export"))
+        .or_else(|| overrides.get("primary"))
+        .map(String::as_str);
+    let ad_import = resolve_import(
+        tx,
+        engagement_id,
+        ad_override,
+        &["ad_export", "entra_export"],
+        "AD or Entra export",
+    )?;
+    let ad_table = load_csv_table(tx, paths, master_key, &ad_import, "AD export")?;
+
+    let threshold_days = access_review::DORMANT_THRESHOLD_DAYS_DEFAULT;
+    let report = access_review::run_dormant_accounts(&ad_table, now, threshold_days);
+    let exception_count = report.exceptions.len() as i64;
+    let summary = if exception_count == 0 {
+        format!(
+            "No dormant accounts across {} AD rows at a {}-day threshold",
+            report.ad_rows_considered, threshold_days
+        )
+    } else {
+        format!(
+            "{} dormant account{} exceeding the {}-day threshold",
+            exception_count,
+            if exception_count == 1 { "" } else { "s" },
+            threshold_days
+        )
+    };
+    let detail = json!({
+        "rule": report.rule,
+        "ad_import_id": ad_import.id,
+        "ad_rows_considered": report.ad_rows_considered,
+        "ad_rows_skipped_disabled": report.ad_rows_skipped_disabled,
+        "ad_rows_skipped_no_last_logon": report.ad_rows_skipped_no_last_logon,
+        "ad_rows_skipped_unparseable": report.ad_rows_skipped_unparseable,
+        "threshold_days": report.threshold_days,
+        "as_of_secs": report.as_of_secs,
+    })
+    .to_string();
+    let report_json = serde_json::to_vec_pretty(&report)?;
+
+    let mut outcome = RuleOutcome::base(
+        report.rule.clone(),
+        "User access review",
+        "access-review",
+        report_json,
+        exception_count,
+        summary,
+        detail,
+        ad_import,
+        "AD export",
+    );
+    outcome.ad_rows_considered = Some(report.ad_rows_considered as i64);
+    outcome.ad_rows_skipped_disabled = Some(report.ad_rows_skipped_disabled as i64);
+    outcome.ad_rows_skipped_no_last_logon = Some(report.ad_rows_skipped_no_last_logon as i64);
+    outcome.ad_rows_skipped_unparseable = Some(report.ad_rows_skipped_unparseable as i64);
+    outcome.dormancy_threshold_days = Some(report.threshold_days as i64);
+    Ok(outcome)
+}
+
+/// UAR orphan-accounts: AD export + HR master → exceptions for enabled AD
+/// accounts whose email/logon do not appear in the authoritative employee
+/// roster. The HR master is the *current* employee list; terminations belong
+/// on the leavers list consumed by the terminated-but-active rule, not here.
+fn run_uar_orphan_accounts(
+    tx: &rusqlite::Transaction<'_>,
+    paths: &AppPaths,
+    engagement_id: &str,
+    master_key: &[u8; 32],
+    overrides: &HashMap<String, String>,
+) -> AppResult<RuleOutcome> {
+    let ad_override = overrides
+        .get("ad_export")
+        .or_else(|| overrides.get("entra_export"))
+        .or_else(|| overrides.get("primary"))
+        .map(String::as_str);
+    let ad_import = resolve_import(
+        tx,
+        engagement_id,
+        ad_override,
+        &["ad_export", "entra_export"],
+        "AD or Entra export",
+    )?;
+    let ad_table = load_csv_table(tx, paths, master_key, &ad_import, "AD export")?;
+
+    let hr_override = overrides
+        .get("hr_master")
+        .or_else(|| overrides.get("hr_roster"))
+        .or_else(|| overrides.get("supporting"))
+        .map(String::as_str);
+    let hr_import = resolve_import(
+        tx,
+        engagement_id,
+        hr_override,
+        &["hr_master", "hr_roster"],
+        "HR master roster",
+    )?;
+    let hr_table = load_csv_table(tx, paths, master_key, &hr_import, "HR master roster")?;
+
+    let report = access_review::run_orphan_accounts(&ad_table, &hr_table);
+    let exception_count = report.exceptions.len() as i64;
+    let summary = if exception_count == 0 {
+        format!(
+            "No orphan accounts across {} AD row{} and {} HR row{}",
+            report.ad_rows_considered,
+            if report.ad_rows_considered == 1 { "" } else { "s" },
+            report.hr_rows_considered,
+            if report.hr_rows_considered == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "{} orphan account{} with no HR record",
+            exception_count,
+            if exception_count == 1 { "" } else { "s" }
+        )
+    };
+    let detail = json!({
+        "rule": report.rule,
+        "ad_import_id": ad_import.id,
+        "hr_master_import_id": hr_import.id,
+        "ad_rows_considered": report.ad_rows_considered,
+        "ad_rows_skipped_disabled": report.ad_rows_skipped_disabled,
+        "ad_rows_skipped_unmatchable": report.ad_rows_skipped_unmatchable,
+        "hr_rows_considered": report.hr_rows_considered,
+    })
+    .to_string();
+    let report_json = serde_json::to_vec_pretty(&report)?;
+
+    let mut outcome = RuleOutcome::base(
+        report.rule.clone(),
+        "User access review",
+        "access-review",
+        report_json,
+        exception_count,
+        summary,
+        detail,
+        ad_import,
+        "AD export",
+    );
+    outcome.supporting_import = Some(hr_import);
+    outcome.ad_rows_considered = Some(report.ad_rows_considered as i64);
+    outcome.ad_rows_skipped_disabled = Some(report.ad_rows_skipped_disabled as i64);
+    outcome.ad_rows_skipped_unmatchable = Some(report.ad_rows_skipped_unmatchable as i64);
+    outcome.hr_rows_considered = Some(report.hr_rows_considered as i64);
+    Ok(outcome)
+}
+
+/// CHG change-approval-before-deployment: change log → exceptions where a
+/// deployed change has missing approval, was approved after deployment, or
+/// had the same person approve and deploy.
+fn run_chg_approval_before_deployment(
+    tx: &rusqlite::Transaction<'_>,
+    paths: &AppPaths,
+    engagement_id: &str,
+    master_key: &[u8; 32],
+    overrides: &HashMap<String, String>,
+) -> AppResult<RuleOutcome> {
+    let changes_override = overrides
+        .get("change_log")
+        .or_else(|| overrides.get("change_register"))
+        .or_else(|| overrides.get("primary"))
+        .map(String::as_str);
+    let changes_import = resolve_import(
+        tx,
+        engagement_id,
+        changes_override,
+        &["change_log", "change_register"],
+        "change log",
+    )?;
+    let changes_table = load_csv_table(tx, paths, master_key, &changes_import, "change log")?;
+
+    let report = change_management::run_change_approval_before_deployment(&changes_table);
+    let exception_count = report.exceptions.len() as i64;
+    let summary = if exception_count == 0 {
+        format!(
+            "No approval exceptions across {} in-scope change{}",
+            report.changes_considered,
+            if report.changes_considered == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "{} approval exception{} across {} in-scope change{}",
+            exception_count,
+            if exception_count == 1 { "" } else { "s" },
+            report.changes_considered,
+            if report.changes_considered == 1 { "" } else { "s" }
+        )
+    };
+    let detail = json!({
+        "rule": report.rule,
+        "change_log_import_id": changes_import.id,
+        "changes_considered": report.changes_considered,
+        "changes_skipped_standard": report.changes_skipped_standard,
+        "changes_skipped_cancelled": report.changes_skipped_cancelled,
+        "changes_skipped_not_deployed": report.changes_skipped_not_deployed,
+        "changes_skipped_no_id": report.changes_skipped_no_id,
+        "changes_skipped_unparseable_dates": report.changes_skipped_unparseable_dates,
+    })
+    .to_string();
+    let report_json = serde_json::to_vec_pretty(&report)?;
+
+    let mut outcome = RuleOutcome::base(
+        report.rule.clone(),
+        "Change management",
+        "change-management",
+        report_json,
+        exception_count,
+        summary,
+        detail,
+        changes_import,
+        "Change log",
+    );
+    outcome.changes_considered = Some(report.changes_considered as i64);
+    outcome.changes_skipped_standard = Some(report.changes_skipped_standard as i64);
+    outcome.changes_skipped_cancelled = Some(report.changes_skipped_cancelled as i64);
+    outcome.changes_skipped_not_deployed = Some(report.changes_skipped_not_deployed as i64);
+    outcome.changes_skipped_no_id = Some(report.changes_skipped_no_id as i64);
+    outcome.changes_skipped_unparseable_dates =
+        Some(report.changes_skipped_unparseable_dates as i64);
+    Ok(outcome)
+}
+
+/// CHG SoD between dev and deploy: reconcile the production-deployment
+/// tool's permission list against the source repository's write-access list.
+/// Any user appearing in both is a potential SoD breach — they could author
+/// a change and deploy it without review unless a documented compensating
+/// control is evidenced.
+///
+/// This is a two-input reconciliation, shaped like the UAR terminated-but-
+/// active matcher (AD × leavers). Primary = deploy permissions, supporting
+/// = source repo access. Purpose-tag aliases: `deploy_permissions` /
+/// `deployment_access` / `primary` for deploy; `source_access` /
+/// `source_repo_access` / `supporting` for source.
+fn run_chg_sod_dev_vs_deploy(
+    tx: &rusqlite::Transaction<'_>,
+    paths: &AppPaths,
+    engagement_id: &str,
+    master_key: &[u8; 32],
+    overrides: &HashMap<String, String>,
+) -> AppResult<RuleOutcome> {
+    let deploy_override = overrides
+        .get("deploy_permissions")
+        .or_else(|| overrides.get("deployment_access"))
+        .or_else(|| overrides.get("primary"))
+        .map(String::as_str);
+    let deploy_import = resolve_import(
+        tx,
+        engagement_id,
+        deploy_override,
+        &["deploy_permissions", "deployment_access"],
+        "deployment permission export",
+    )?;
+    let deploy_table = load_csv_table(
+        tx,
+        paths,
+        master_key,
+        &deploy_import,
+        "deployment permission export",
+    )?;
+
+    let source_override = overrides
+        .get("source_access")
+        .or_else(|| overrides.get("source_repo_access"))
+        .or_else(|| overrides.get("supporting"))
+        .map(String::as_str);
+    let source_import = resolve_import(
+        tx,
+        engagement_id,
+        source_override,
+        &["source_access", "source_repo_access"],
+        "source repository access export",
+    )?;
+    let source_table = load_csv_table(
+        tx,
+        paths,
+        master_key,
+        &source_import,
+        "source repository access export",
+    )?;
+
+    let report = change_management::run_sod_dev_vs_deploy(&deploy_table, &source_table);
+    let exception_count = report.exceptions.len() as i64;
+    let summary = if exception_count == 0 {
+        format!(
+            "No SoD overlap across {} deploy-permission row{} and {} source-access row{}",
+            report.deploy_rows_considered,
+            if report.deploy_rows_considered == 1 { "" } else { "s" },
+            report.source_rows_considered,
+            if report.source_rows_considered == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "{} user{} with both deploy-to-production and source-write access",
+            exception_count,
+            if exception_count == 1 { "" } else { "s" }
+        )
+    };
+    let detail = json!({
+        "rule": report.rule,
+        "deploy_import_id": deploy_import.id,
+        "source_import_id": source_import.id,
+        "deploy_rows_considered": report.deploy_rows_considered,
+        "deploy_rows_skipped_unmatchable": report.deploy_rows_skipped_unmatchable,
+        "source_rows_considered": report.source_rows_considered,
+        "source_rows_skipped_unmatchable": report.source_rows_skipped_unmatchable,
+        "deploy_unique_users": report.deploy_unique_users,
+        "source_unique_users": report.source_unique_users,
+        "intersecting_users": report.intersecting_users,
+    })
+    .to_string();
+    let report_json = serde_json::to_vec_pretty(&report)?;
+
+    let mut outcome = RuleOutcome::base(
+        report.rule.clone(),
+        "Change management",
+        "change-management-sod",
+        report_json,
+        exception_count,
+        summary,
+        detail,
+        deploy_import,
+        "Deployment permission export",
+    );
+    outcome.supporting_import = Some(source_import);
+    outcome.deploy_rows_considered = Some(report.deploy_rows_considered as i64);
+    outcome.deploy_rows_skipped_unmatchable = Some(report.deploy_rows_skipped_unmatchable as i64);
+    outcome.source_rows_considered = Some(report.source_rows_considered as i64);
+    outcome.source_rows_skipped_unmatchable = Some(report.source_rows_skipped_unmatchable as i64);
+    outcome.intersecting_users = Some(report.intersecting_users as i64);
+    Ok(outcome)
+}
+
+/// BKP backup-performance: backup log → exceptions for failed jobs and (if
+/// a verification column is present) jobs the tool reports as unverified.
+fn run_bkp_performance(
+    tx: &rusqlite::Transaction<'_>,
+    paths: &AppPaths,
+    engagement_id: &str,
+    master_key: &[u8; 32],
+    overrides: &HashMap<String, String>,
+) -> AppResult<RuleOutcome> {
+    let jobs_override = overrides
+        .get("backup_log")
+        .or_else(|| overrides.get("backup_register"))
+        .or_else(|| overrides.get("primary"))
+        .map(String::as_str);
+    let jobs_import = resolve_import(
+        tx,
+        engagement_id,
+        jobs_override,
+        &["backup_log", "backup_register"],
+        "backup log",
+    )?;
+    let jobs_table = load_csv_table(tx, paths, master_key, &jobs_import, "backup log")?;
+
+    let report = backup::run_backup_performance(&jobs_table);
+    let exception_count = report.exceptions.len() as i64;
+    let summary = if exception_count == 0 {
+        format!(
+            "No failed or unverified backups across {} job{}",
+            report.jobs_considered,
+            if report.jobs_considered == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "{} backup exception{} across {} job{}",
+            exception_count,
+            if exception_count == 1 { "" } else { "s" },
+            report.jobs_considered,
+            if report.jobs_considered == 1 { "" } else { "s" }
+        )
+    };
+    let detail = json!({
+        "rule": report.rule,
+        "backup_log_import_id": jobs_import.id,
+        "jobs_considered": report.jobs_considered,
+        "jobs_skipped_no_id": report.jobs_skipped_no_id,
+        "jobs_skipped_unknown_status": report.jobs_skipped_unknown_status,
+    })
+    .to_string();
+    let report_json = serde_json::to_vec_pretty(&report)?;
+
+    let mut outcome = RuleOutcome::base(
+        report.rule.clone(),
+        "Backup",
+        "backup",
+        report_json,
+        exception_count,
+        summary,
+        detail,
+        jobs_import,
+        "Backup log",
+    );
+    outcome.jobs_considered = Some(report.jobs_considered as i64);
+    outcome.jobs_skipped_no_id = Some(report.jobs_skipped_no_id as i64);
+    outcome.jobs_skipped_unknown_status = Some(report.jobs_skipped_unknown_status as i64);
+    Ok(outcome)
+}
+
+/// ITAC Benford first-digit: transaction register → exceptions for leading
+/// digits that materially deviate from the expected Benford frequencies.
+/// The chi-square statistic lives in the detail JSON; each flagged digit
+/// becomes one auditor-facing exception with the observed-vs-expected gap.
+fn run_itac_benford_first_digit(
+    tx: &rusqlite::Transaction<'_>,
+    paths: &AppPaths,
+    engagement_id: &str,
+    master_key: &[u8; 32],
+    overrides: &HashMap<String, String>,
+) -> AppResult<RuleOutcome> {
+    let txn_override = overrides
+        .get("transaction_register")
+        .or_else(|| overrides.get("transactions"))
+        .or_else(|| overrides.get("gl_export"))
+        .or_else(|| overrides.get("primary"))
+        .map(String::as_str);
+    let txn_import = resolve_import(
+        tx,
+        engagement_id,
+        txn_override,
+        &["transaction_register", "transactions", "gl_export"],
+        "transaction register",
+    )?;
+    let txn_table = load_csv_table(tx, paths, master_key, &txn_import, "transaction register")?;
+
+    let report = itac_benford::run_benford_first_digit(&txn_table);
+    let exception_count = report.exceptions.len() as i64;
+    let summary = if exception_count == 0 {
+        format!(
+            "Population consistent with Benford across {} evaluated transaction{}",
+            report.digit_rows_evaluated,
+            if report.digit_rows_evaluated == 1 { "" } else { "s" }
+        )
+    } else if report
+        .exceptions
+        .iter()
+        .any(|e| e.kind == "population_too_small")
+    {
+        format!(
+            "Population too small for Benford analysis ({} digit row{}; {} required)",
+            report.digit_rows_evaluated,
+            if report.digit_rows_evaluated == 1 { "" } else { "s" },
+            report.min_digit_rows
+        )
+    } else {
+        format!(
+            "{} digit{} deviate materially from Benford across {} evaluated transaction{}",
+            exception_count,
+            if exception_count == 1 { "" } else { "s" },
+            report.digit_rows_evaluated,
+            if report.digit_rows_evaluated == 1 { "" } else { "s" }
+        )
+    };
+    let detail = json!({
+        "rule": report.rule,
+        "transaction_register_import_id": txn_import.id,
+        "rows_considered": report.rows_considered,
+        "rows_skipped_unparseable": report.rows_skipped_unparseable,
+        "rows_skipped_zero": report.rows_skipped_zero,
+        "digit_rows_evaluated": report.digit_rows_evaluated,
+        "chi_square": report.chi_square,
+        "chi_square_critical": report.chi_square_critical,
+        "min_digit_rows": report.min_digit_rows,
+        "digit_deviation_threshold": report.digit_deviation_threshold,
+    })
+    .to_string();
+    let report_json = serde_json::to_vec_pretty(&report)?;
+
+    let mut outcome = RuleOutcome::base(
+        report.rule.clone(),
+        "IT application controls",
+        "itac-benford",
+        report_json,
+        exception_count,
+        summary,
+        detail,
+        txn_import,
+        "Transaction register",
+    );
+    outcome.transactions_considered = Some(report.rows_considered as i64);
+    outcome.transactions_skipped_unparseable = Some(report.rows_skipped_unparseable as i64);
+    outcome.transactions_skipped_zero = Some(report.rows_skipped_zero as i64);
+    outcome.digit_rows_evaluated = Some(report.digit_rows_evaluated as i64);
+    Ok(outcome)
+}
+
+/// ITAC duplicate-transaction detection: group the population by
+/// (amount, counterparty, date) and report each group of two or more rows.
+/// Genuine business activity rarely produces exact triples, so flagged
+/// groups are investigated as potential double-postings, duplicated
+/// invoices, or fabricated records. Reuses the Benford rule's
+/// `transaction_register` purpose tag — both consume the same export.
+fn run_itac_duplicate_transactions(
+    tx: &rusqlite::Transaction<'_>,
+    paths: &AppPaths,
+    engagement_id: &str,
+    master_key: &[u8; 32],
+    overrides: &HashMap<String, String>,
+) -> AppResult<RuleOutcome> {
+    let txn_override = overrides
+        .get("transaction_register")
+        .or_else(|| overrides.get("transactions"))
+        .or_else(|| overrides.get("gl_export"))
+        .or_else(|| overrides.get("primary"))
+        .map(String::as_str);
+    let txn_import = resolve_import(
+        tx,
+        engagement_id,
+        txn_override,
+        &["transaction_register", "transactions", "gl_export"],
+        "transaction register",
+    )?;
+    let txn_table = load_csv_table(tx, paths, master_key, &txn_import, "transaction register")?;
+
+    let report = itac_duplicates::run_duplicate_transactions(&txn_table);
+    let exception_count = report.exceptions.len() as i64;
+    let summary = if exception_count == 0 {
+        format!(
+            "No duplicate transactions found across {} considered row{}",
+            report.rows_considered,
+            if report.rows_considered == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "{} duplicate group{} covering {} row{} across {} considered row{}",
+            report.duplicate_group_count,
+            if report.duplicate_group_count == 1 { "" } else { "s" },
+            report.total_duplicate_rows,
+            if report.total_duplicate_rows == 1 { "" } else { "s" },
+            report.rows_considered,
+            if report.rows_considered == 1 { "" } else { "s" }
+        )
+    };
+    let detail = json!({
+        "rule": report.rule,
+        "transaction_register_import_id": txn_import.id,
+        "rows_considered": report.rows_considered,
+        "rows_skipped_unparseable": report.rows_skipped_unparseable,
+        "rows_skipped_zero": report.rows_skipped_zero,
+        "rows_skipped_no_key": report.rows_skipped_no_key,
+        "duplicate_group_count": report.duplicate_group_count,
+        "total_duplicate_rows": report.total_duplicate_rows,
+    })
+    .to_string();
+    let report_json = serde_json::to_vec_pretty(&report)?;
+
+    let mut outcome = RuleOutcome::base(
+        report.rule.clone(),
+        "IT application controls",
+        "itac-duplicates",
+        report_json,
+        exception_count,
+        summary,
+        detail,
+        txn_import,
+        "Transaction register",
+    );
+    outcome.transactions_considered = Some(report.rows_considered as i64);
+    outcome.transactions_skipped_unparseable = Some(report.rows_skipped_unparseable as i64);
+    outcome.transactions_skipped_zero = Some(report.rows_skipped_zero as i64);
+    outcome.transactions_skipped_no_key = Some(report.rows_skipped_no_key as i64);
+    outcome.duplicate_group_count = Some(report.duplicate_group_count as i64);
+    outcome.total_duplicate_rows = Some(report.total_duplicate_rows as i64);
+    Ok(outcome)
 }
 
 pub(crate) fn list_test_results(
@@ -1880,8 +2676,9 @@ mod tests {
         // UAM-C-001 and UAM-C-002 both reference UAM-R-001. Cloning both
         // should collapse onto one EngagementRisk, two EngagementControls,
         // and one Test per test procedure beneath the cloned controls. The
-        // current library (v0.2.0) ships UAM-T-001 under UAM-C-001 and
-        // UAM-T-002 + UAM-T-003 under UAM-C-002, so we expect 3 Tests.
+        // current library (v0.3.0) ships UAM-T-001 under UAM-C-001 and
+        // UAM-T-002 + UAM-T-003 + UAM-T-004 under UAM-C-002, so we expect
+        // 4 Tests.
         let (db, path) = seeded_db("firm-t2", "user-t2", "client-t2", "eng-t2");
         let auth = session_for("firm-t2", "user-t2");
 
@@ -1927,7 +2724,7 @@ mod tests {
                 [],
                 |r| r.get(0),
             )?;
-            assert_eq!(test_count, 3);
+            assert_eq!(test_count, 4);
             Ok(())
         })
         .unwrap();
@@ -2101,7 +2898,7 @@ mod tests {
     }
 
     #[test]
-    fn run_access_review_produces_exception_test_result_and_updates_test_status() {
+    fn run_matcher_uar_produces_exception_test_result_and_updates_test_status() {
         let (db, db_path) = seeded_db("firm-m1", "user-m1", "client-m1", "eng-m1");
         let auth = session_for("firm-m1", "user-m1");
         let blob_dir = tempfile::tempdir().unwrap();
@@ -2154,21 +2951,20 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_access_review(
+        let result = run_matcher(
             &db,
             &auth,
             &paths,
-            RunAccessReviewInput {
+            RunMatcherInput {
                 test_id: test_id.clone(),
-                ad_import_id: None,
-                leavers_import_id: None,
+                overrides: None,
             },
         )
         .unwrap();
 
         assert_eq!(result.outcome, "exception");
         assert_eq!(result.exception_count, 1);
-        assert_eq!(result.ad_rows_skipped_disabled, 1);
+        assert_eq!(result.ad_rows_skipped_disabled, Some(1));
 
         db.with(|conn| {
             let (outcome, evidence, blob_id, pop_label, detail): (
@@ -2215,7 +3011,7 @@ mod tests {
     }
 
     #[test]
-    fn run_access_review_passes_when_no_leaver_is_enabled() {
+    fn run_matcher_uar_passes_when_no_leaver_is_enabled() {
         let (db, db_path) = seeded_db("firm-m2", "user-m2", "client-m2", "eng-m2");
         let auth = session_for("firm-m2", "user-m2");
         let blob_dir = tempfile::tempdir().unwrap();
@@ -2264,14 +3060,13 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_access_review(
+        let result = run_matcher(
             &db,
             &auth,
             &paths,
-            RunAccessReviewInput {
+            RunMatcherInput {
                 test_id,
-                ad_import_id: None,
-                leavers_import_id: None,
+                overrides: None,
             },
         )
         .unwrap();
@@ -2281,7 +3076,7 @@ mod tests {
     }
 
     #[test]
-    fn run_access_review_errors_when_no_ad_import_uploaded() {
+    fn run_matcher_uar_errors_when_no_ad_import_uploaded() {
         let (db, db_path) = seeded_db("firm-m3", "user-m3", "client-m3", "eng-m3");
         let auth = session_for("firm-m3", "user-m3");
         let blob_dir = tempfile::tempdir().unwrap();
@@ -2299,14 +3094,13 @@ mod tests {
         .unwrap();
         let test_id = clone.test_ids[0].clone();
 
-        let err = run_access_review(
+        let err = run_matcher(
             &db,
             &auth,
             &paths,
-            RunAccessReviewInput {
+            RunMatcherInput {
                 test_id,
-                ad_import_id: None,
-                leavers_import_id: None,
+                overrides: None,
             },
         )
         .unwrap_err();
@@ -2315,7 +3109,7 @@ mod tests {
     }
 
     #[test]
-    fn run_access_review_rejects_test_from_other_firm() {
+    fn run_matcher_rejects_test_from_other_firm() {
         let (db, db_path) = seeded_db("firm-m4", "user-m4", "client-m4", "eng-m4");
         let mine = session_for("firm-m4", "user-m4");
         let blob_dir = tempfile::tempdir().unwrap();
@@ -2334,14 +3128,13 @@ mod tests {
         let test_id = clone.test_ids[0].clone();
 
         let other = session_for("firm-other", "user-m4");
-        let err = run_access_review(
+        let err = run_matcher(
             &db,
             &other,
             &paths,
-            RunAccessReviewInput {
+            RunMatcherInput {
                 test_id,
-                ad_import_id: None,
-                leavers_import_id: None,
+                overrides: None,
             },
         )
         .unwrap_err();
@@ -2399,26 +3192,24 @@ mod tests {
         )
         .unwrap();
 
-        run_access_review(
+        run_matcher(
             &db,
             &auth,
             &paths,
-            RunAccessReviewInput {
+            RunMatcherInput {
                 test_id: test_id.clone(),
-                ad_import_id: None,
-                leavers_import_id: None,
+                overrides: None,
             },
         )
         .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        run_access_review(
+        run_matcher(
             &db,
             &auth,
             &paths,
-            RunAccessReviewInput {
+            RunMatcherInput {
                 test_id: test_id.clone(),
-                ad_import_id: None,
-                leavers_import_id: None,
+                overrides: None,
             },
         )
         .unwrap();
@@ -2489,7 +3280,7 @@ mod tests {
     }
 
     #[test]
-    fn run_access_review_dormant_flags_stale_accounts_without_leavers_input() {
+    fn run_matcher_uar_dormant_flags_stale_accounts_without_leavers_input() {
         // Clone UAM-C-002 to get the dormant-accounts test (UAM-T-003). Upload
         // only an AD export — no HR leavers list. The matcher should flag
         // alice (last logon 2020-01-01) and never-signed-in carol; bob (recent)
@@ -2550,14 +3341,13 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_access_review(
+        let result = run_matcher(
             &db,
             &auth,
             &paths,
-            RunAccessReviewInput {
+            RunMatcherInput {
                 test_id: dormant_test_id.clone(),
-                ad_import_id: None,
-                leavers_import_id: None,
+                overrides: None,
             },
         )
         .unwrap();
@@ -2569,7 +3359,7 @@ mod tests {
             result.dormancy_threshold_days,
             Some(access_review::DORMANT_THRESHOLD_DAYS_DEFAULT as i64)
         );
-        assert!(result.leavers_import_id.is_none());
+        assert!(result.supporting_import_id.is_none());
         assert!(result.leaver_rows_considered.is_none());
 
         db.with(|conn| {
@@ -2593,11 +3383,60 @@ mod tests {
     }
 
     #[test]
-    fn run_access_review_rejects_test_code_that_has_no_rule() {
-        // CHG-T-001 has no matcher wired up; the command must reject it
-        // cleanly rather than silently falling through to a default rule.
+    fn run_matcher_rejects_test_code_that_has_no_rule() {
+        // UAM-T-002 (the periodic-recertification test) has no matcher wired
+        // up; the command must reject it cleanly rather than silently falling
+        // through to a default rule. UAM-T-002 sits under UAM-C-002 alongside
+        // UAM-T-003 (dormant accounts), so cloning the parent control gives
+        // us both tests.
         let (db, db_path) = seeded_db("firm-dm2", "user-dm2", "client-dm2", "eng-dm2");
         let auth = session_for("firm-dm2", "user-dm2");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-dm2".into(),
+                library_control_id: library_control_id(&db, "UAM-C-002"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+
+        let unwired_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-dm2' AND code = 'UAM-T-002'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+
+        let err = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: unwired_test_id,
+                overrides: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Message(_)));
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn run_matcher_chg_flags_approval_exceptions_for_deployed_changes() {
+        // CHG-C-001 ships CHG-T-001 as a rule-based test. Seed a change log
+        // with three production deployments: one missing approval, one
+        // approved after deployment, one with approver == implementer. The
+        // matcher should emit three exceptions and mark the test in_review.
+        let (db, db_path) = seeded_db("firm-chg1", "user-chg1", "client-chg1", "eng-chg1");
+        let auth = session_for("firm-chg1", "user-chg1");
         let blob_dir = tempfile::tempdir().unwrap();
         let paths = paths_for(blob_dir.path());
 
@@ -2605,26 +3444,1225 @@ mod tests {
             &db,
             &auth,
             AddLibraryControlInput {
-                engagement_id: "eng-dm2".into(),
+                engagement_id: "eng-chg1".into(),
                 library_control_id: library_control_id(&db, "CHG-C-001"),
                 system_id: None,
             },
         )
         .unwrap();
-        let chg_test_id = clone.test_ids[0].clone();
 
-        let err = run_access_review(
+        let chg_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-chg1' AND code = 'CHG-T-001'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert!(clone.test_ids.contains(&chg_test_id));
+
+        let csv = b"change_id,change_type,status,approver,approved_at,implementer,deployed_at\n\
+                    CHG-1001,Normal,Deployed,,,alice,2025-03-01T10:00:00Z\n\
+                    CHG-1002,Normal,Deployed,bob,2025-03-03T10:00:00Z,carol,2025-03-02T10:00:00Z\n\
+                    CHG-1003,Normal,Deployed,dan,2025-03-01T08:00:00Z,dan,2025-03-01T10:00:00Z\n";
+        upload_data_import(
             &db,
             &auth,
             &paths,
-            RunAccessReviewInput {
-                test_id: chg_test_id,
-                ad_import_id: None,
-                leavers_import_id: None,
+            UploadDataImportInput {
+                engagement_id: "eng-chg1".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "change_log".into(),
+                filename: "changes.csv".into(),
+                mime_type: Some("text/csv".into()),
+                content: csv.to_vec(),
             },
         )
-        .unwrap_err();
-        assert!(matches!(err, AppError::Message(_)));
+        .unwrap();
+
+        let result = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: chg_test_id.clone(),
+                overrides: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.rule, "change_approval_before_deployment");
+        assert_eq!(result.outcome, "exception");
+        assert_eq!(result.exception_count, 3);
+        assert_eq!(result.changes_considered, Some(3));
+        assert_eq!(result.changes_skipped_standard, Some(0));
+        assert!(result.supporting_import_id.is_none());
+        assert_eq!(result.primary_import_filename.as_deref(), Some("changes.csv"));
+
+        db.with(|conn| {
+            let (outcome, evidence, pop_label, detail): (String, i64, String, String) = conn
+                .query_row(
+                    "SELECT outcome, evidence_count, population_ref_label, detail_json
+                     FROM TestResult WHERE id = ?1",
+                    params![result.test_result_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )?;
+            assert_eq!(outcome, "exception");
+            assert_eq!(evidence, 3);
+            assert!(pop_label.starts_with("Change log:"));
+            assert!(detail.contains("change_approval_before_deployment"));
+
+            let test_status: String = conn.query_row(
+                "SELECT status FROM Test WHERE id = ?1",
+                params![chg_test_id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(test_status, "in_review");
+
+            let activity_summary: String = conn.query_row(
+                "SELECT summary FROM ActivityLog
+                 WHERE engagement_id = 'eng-chg1' AND action = 'matcher_run'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert!(activity_summary.starts_with("Change management matcher on CHG-T-001"));
+            Ok(())
+        })
+        .unwrap();
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn run_matcher_chg_passes_when_all_deployed_changes_have_clean_approvals() {
+        let (db, db_path) = seeded_db("firm-chg2", "user-chg2", "client-chg2", "eng-chg2");
+        let auth = session_for("firm-chg2", "user-chg2");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-chg2".into(),
+                library_control_id: library_control_id(&db, "CHG-C-001"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+        let chg_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-chg2' AND code = 'CHG-T-001'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+
+        // Two clean deployments + one standard (pre-approved) change that the
+        // rule must count and skip rather than flag.
+        let csv = b"change_id,change_type,status,approver,approved_at,implementer,deployed_at\n\
+                    CHG-2001,Normal,Deployed,bob,2025-03-01T08:00:00Z,alice,2025-03-01T10:00:00Z\n\
+                    CHG-2002,Normal,Deployed,bob,2025-03-02T08:00:00Z,alice,2025-03-02T10:00:00Z\n\
+                    CHG-2003,Standard,Deployed,,,alice,2025-03-03T10:00:00Z\n";
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-chg2".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "change_log".into(),
+                filename: "changes.csv".into(),
+                mime_type: None,
+                content: csv.to_vec(),
+            },
+        )
+        .unwrap();
+
+        let result = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: chg_test_id,
+                overrides: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.outcome, "pass");
+        assert_eq!(result.exception_count, 0);
+        // changes_considered counts every row in the CSV. In-scope rows are
+        // what's left after skipped_standard / skipped_cancelled /
+        // skipped_not_deployed / skipped_no_id / skipped_unparseable_dates
+        // are subtracted.
+        assert_eq!(result.changes_considered, Some(3));
+        assert_eq!(result.changes_skipped_standard, Some(1));
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn run_matcher_bkp_flags_failed_jobs() {
+        let (db, db_path) = seeded_db("firm-bkp1", "user-bkp1", "client-bkp1", "eng-bkp1");
+        let auth = session_for("firm-bkp1", "user-bkp1");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        let clone = clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-bkp1".into(),
+                library_control_id: library_control_id(&db, "BKP-C-001"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+        let bkp_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-bkp1' AND code = 'BKP-T-001'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert!(clone.test_ids.contains(&bkp_test_id));
+
+        // Four jobs: one success, one failed, one cancelled, one with an
+        // unknown status string that should be skipped rather than flagged.
+        let csv = b"job_id,target,status,started_at,completed_at\n\
+                    JOB-1,db-prod,Success,2025-03-01T02:00:00Z,2025-03-01T02:45:00Z\n\
+                    JOB-2,db-prod,Failed,2025-03-02T02:00:00Z,2025-03-02T02:15:00Z\n\
+                    JOB-3,db-prod,Cancelled,2025-03-03T02:00:00Z,\n\
+                    JOB-4,db-prod,Queued,,\n";
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-bkp1".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "backup_log".into(),
+                filename: "backups.csv".into(),
+                mime_type: Some("text/csv".into()),
+                content: csv.to_vec(),
+            },
+        )
+        .unwrap();
+
+        let result = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: bkp_test_id.clone(),
+                overrides: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.rule, "backup_performance");
+        assert_eq!(result.outcome, "exception");
+        assert_eq!(result.exception_count, 2);
+        assert_eq!(result.jobs_considered, Some(4));
+        assert_eq!(result.jobs_skipped_unknown_status, Some(1));
+        assert_eq!(result.jobs_skipped_no_id, Some(0));
+        assert_eq!(result.primary_import_filename.as_deref(), Some("backups.csv"));
+
+        db.with(|conn| {
+            let (outcome, pop_label, detail): (String, String, String) = conn.query_row(
+                "SELECT outcome, population_ref_label, detail_json
+                 FROM TestResult WHERE id = ?1",
+                params![result.test_result_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            assert_eq!(outcome, "exception");
+            assert!(pop_label.starts_with("Backup log:"));
+            assert!(detail.contains("backup_performance"));
+
+            let test_status: String = conn.query_row(
+                "SELECT status FROM Test WHERE id = ?1",
+                params![bkp_test_id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(test_status, "in_review");
+
+            let activity_summary: String = conn.query_row(
+                "SELECT summary FROM ActivityLog
+                 WHERE engagement_id = 'eng-bkp1' AND action = 'matcher_run'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert!(activity_summary.starts_with("Backup matcher on BKP-T-001"));
+            Ok(())
+        })
+        .unwrap();
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn run_matcher_bkp_passes_when_all_jobs_succeed() {
+        let (db, db_path) = seeded_db("firm-bkp2", "user-bkp2", "client-bkp2", "eng-bkp2");
+        let auth = session_for("firm-bkp2", "user-bkp2");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-bkp2".into(),
+                library_control_id: library_control_id(&db, "BKP-C-001"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+        let bkp_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-bkp2' AND code = 'BKP-T-001'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+
+        let csv = b"job_id,target,status,started_at,completed_at\n\
+                    JOB-A,db-prod,Success,2025-03-01T02:00:00Z,2025-03-01T02:45:00Z\n\
+                    JOB-B,file-srv,Completed,2025-03-02T02:00:00Z,2025-03-02T02:30:00Z\n";
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-bkp2".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "backup_log".into(),
+                filename: "backups.csv".into(),
+                mime_type: None,
+                content: csv.to_vec(),
+            },
+        )
+        .unwrap();
+
+        let result = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: bkp_test_id,
+                overrides: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.outcome, "pass");
+        assert_eq!(result.exception_count, 0);
+        assert_eq!(result.jobs_considered, Some(2));
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn run_matcher_orphan_accounts_flags_ad_rows_with_no_hr_match() {
+        // UAM-C-002 ships UAM-T-004 as the orphan-accounts procedure.
+        // Seed an AD export with three enabled users and one disabled user.
+        // The HR master only contains alice and bob — carol is the orphan,
+        // dan is disabled so should be skipped.
+        let (db, db_path) = seeded_db("firm-orph1", "user-orph1", "client-orph1", "eng-orph1");
+        let auth = session_for("firm-orph1", "user-orph1");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-orph1".into(),
+                library_control_id: library_control_id(&db, "UAM-C-002"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+        let orphan_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-orph1' AND code = 'UAM-T-004'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-orph1".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "ad_export".into(),
+                filename: "ad.csv".into(),
+                mime_type: Some("text/csv".into()),
+                content: b"sAMAccountName,email,enabled\n\
+                           alice,alice@acme.com,TRUE\n\
+                           bob,bob@acme.com,TRUE\n\
+                           carol,carol@acme.com,TRUE\n\
+                           dan,dan@acme.com,FALSE\n"
+                    .to_vec(),
+            },
+        )
+        .unwrap();
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-orph1".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "hr_master".into(),
+                filename: "hr.csv".into(),
+                mime_type: Some("text/csv".into()),
+                content: b"employee_id,email,sAMAccountName\n\
+                           1,alice@acme.com,alice\n\
+                           2,bob@acme.com,bob\n"
+                    .to_vec(),
+            },
+        )
+        .unwrap();
+
+        let result = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: orphan_test_id.clone(),
+                overrides: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.rule, "orphan_accounts");
+        assert_eq!(result.outcome, "exception");
+        assert_eq!(result.exception_count, 1);
+        // `ad_rows_considered` is the full AD row count (incl. disabled);
+        // `ad_rows_skipped_disabled` is the disabled subset. Dan is disabled
+        // so is not evaluated, but still counted in the total.
+        assert_eq!(result.ad_rows_considered, Some(4));
+        assert_eq!(result.ad_rows_skipped_disabled, Some(1));
+        assert_eq!(result.hr_rows_considered, Some(2));
+        // Orphan-accounts does not use the leavers counter — that belongs
+        // to the terminated-but-active rule. Keep the families distinct.
+        assert!(result.leaver_rows_considered.is_none());
+        assert!(result.supporting_import_id.is_some());
+        assert!(result
+            .supporting_import_filename
+            .as_deref()
+            .map(|n| n == "hr.csv")
+            .unwrap_or(false));
+
+        db.with(|conn| {
+            let (outcome, detail): (String, String) = conn.query_row(
+                "SELECT outcome, detail_json FROM TestResult WHERE id = ?1",
+                params![result.test_result_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert_eq!(outcome, "exception");
+            assert!(detail.contains("orphan_accounts"));
+            assert!(detail.contains("hr_rows_considered"));
+
+            let test_status: String = conn.query_row(
+                "SELECT status FROM Test WHERE id = ?1",
+                params![orphan_test_id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(test_status, "in_review");
+
+            let activity: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ActivityLog
+                 WHERE engagement_id = 'eng-orph1' AND action = 'matcher_run'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(activity, 1);
+            Ok(())
+        })
+        .unwrap();
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn run_matcher_orphan_accounts_passes_when_all_ad_rows_have_hr_match() {
+        // All enabled AD accounts appear in the HR master — matcher passes.
+        let (db, db_path) = seeded_db("firm-orph2", "user-orph2", "client-orph2", "eng-orph2");
+        let auth = session_for("firm-orph2", "user-orph2");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-orph2".into(),
+                library_control_id: library_control_id(&db, "UAM-C-002"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+        let orphan_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-orph2' AND code = 'UAM-T-004'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-orph2".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "ad_export".into(),
+                filename: "ad.csv".into(),
+                mime_type: None,
+                content: b"email,enabled\nalice@a.com,TRUE\nbob@a.com,TRUE\n".to_vec(),
+            },
+        )
+        .unwrap();
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-orph2".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "hr_master".into(),
+                filename: "hr.csv".into(),
+                mime_type: None,
+                content: b"email\nalice@a.com\nbob@a.com\ncarol@a.com\n".to_vec(),
+            },
+        )
+        .unwrap();
+
+        let result = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: orphan_test_id,
+                overrides: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.rule, "orphan_accounts");
+        assert_eq!(result.outcome, "pass");
+        assert_eq!(result.exception_count, 0);
+        assert_eq!(result.ad_rows_considered, Some(2));
+        assert_eq!(result.hr_rows_considered, Some(3));
+        cleanup(&db_path);
+    }
+
+    // -------- ITAC Benford first-digit tests --------
+
+    /// Build a CSV population whose leading-digit distribution is
+    /// approximately uniform across 1..9. At n=450 this is large enough to
+    /// clear the 300-row minimum while being catastrophically non-Benford:
+    /// the chi-square blows past the critical value and at least one digit
+    /// trips the 2pp deviation threshold.
+    fn uniform_transaction_csv() -> String {
+        let mut s = String::from("txn_id,amount\n");
+        let exemplars: [&str; 9] = [
+            "123.45", "234.50", "345.00", "456.00", "567.00", "678.00", "789.00", "890.00",
+            "987.00",
+        ];
+        let per_digit = 50usize;
+        let mut idx = 1;
+        for exemplar in &exemplars {
+            for _ in 0..per_digit {
+                s.push_str(&format!("{},{}\n", idx, exemplar));
+                idx += 1;
+            }
+        }
+        s
+    }
+
+    /// Build a CSV population whose leading-digit distribution is
+    /// approximately Benford. At n≈1000 this sits comfortably under every
+    /// deviation threshold and is the happy-path fixture.
+    fn benford_transaction_csv() -> String {
+        let targets: [usize; 9] = [301, 176, 125, 97, 79, 67, 58, 51, 46];
+        let mut s = String::from("txn_id,amount\n");
+        let exemplars: [&str; 9] = [
+            "123.45", "2345.67", "34.50", "4500.00", "5.75", "64.20", "7123.99", "850.00",
+            "9.99",
+        ];
+        let mut idx = 1;
+        for (digit_i, count) in targets.iter().enumerate() {
+            for _ in 0..*count {
+                s.push_str(&format!("{},{}\n", idx, exemplars[digit_i]));
+                idx += 1;
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn run_matcher_itac_benford_flags_uniform_digit_distribution() {
+        // ITAC-C-001 ships ITAC-T-001 as the Benford first-digit procedure.
+        // Seed a uniform-digit population; the matcher should flag multiple
+        // digits as deviating from Benford and elevate the test to in_review.
+        let (db, db_path) = seeded_db("firm-bf1", "user-bf1", "client-bf1", "eng-bf1");
+        let auth = session_for("firm-bf1", "user-bf1");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-bf1".into(),
+                library_control_id: library_control_id(&db, "ITAC-C-001"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+        let benford_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-bf1' AND code = 'ITAC-T-001'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-bf1".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "transaction_register".into(),
+                filename: "txns.csv".into(),
+                mime_type: Some("text/csv".into()),
+                content: uniform_transaction_csv().into_bytes(),
+            },
+        )
+        .unwrap();
+
+        let result = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: benford_test_id.clone(),
+                overrides: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.rule, "benford_first_digit");
+        assert_eq!(result.outcome, "exception");
+        assert!(result.exception_count >= 1);
+        assert_eq!(result.transactions_considered, Some(450));
+        assert_eq!(result.transactions_skipped_unparseable, Some(0));
+        assert_eq!(result.transactions_skipped_zero, Some(0));
+        assert_eq!(result.digit_rows_evaluated, Some(450));
+        // ITAC is a population-level test, no supporting import.
+        assert!(result.supporting_import_id.is_none());
+        assert_eq!(
+            result.primary_import_filename.as_deref(),
+            Some("txns.csv")
+        );
+
+        db.with(|conn| {
+            let (outcome, pop_label, detail): (String, String, String) = conn.query_row(
+                "SELECT outcome, population_ref_label, detail_json
+                 FROM TestResult WHERE id = ?1",
+                params![result.test_result_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            assert_eq!(outcome, "exception");
+            assert!(pop_label.contains("txns.csv"));
+            assert!(detail.contains("benford_first_digit"));
+            assert!(detail.contains("chi_square"));
+            assert!(detail.contains("digit_rows_evaluated"));
+
+            let test_status: String = conn.query_row(
+                "SELECT status FROM Test WHERE id = ?1",
+                params![benford_test_id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(test_status, "in_review");
+
+            let activity: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ActivityLog
+                 WHERE engagement_id = 'eng-bf1' AND action = 'matcher_run'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(activity, 1);
+            Ok(())
+        })
+        .unwrap();
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn run_matcher_itac_benford_passes_on_benford_like_population() {
+        // Population is approximately Benford — matcher passes, detail_json
+        // records a chi-square below the 8-df critical value.
+        let (db, db_path) = seeded_db("firm-bf2", "user-bf2", "client-bf2", "eng-bf2");
+        let auth = session_for("firm-bf2", "user-bf2");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-bf2".into(),
+                library_control_id: library_control_id(&db, "ITAC-C-001"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+        let benford_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-bf2' AND code = 'ITAC-T-001'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-bf2".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "transaction_register".into(),
+                filename: "txns.csv".into(),
+                mime_type: None,
+                content: benford_transaction_csv().into_bytes(),
+            },
+        )
+        .unwrap();
+
+        let result = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: benford_test_id,
+                overrides: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.rule, "benford_first_digit");
+        assert_eq!(result.outcome, "pass");
+        assert_eq!(result.exception_count, 0);
+        assert!(result.digit_rows_evaluated.unwrap() >= 300);
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn run_matcher_itac_benford_flags_small_population() {
+        // Below the 300-row minimum, the matcher emits a single
+        // population_too_small exception and does no digit-level analysis.
+        let (db, db_path) = seeded_db("firm-bf3", "user-bf3", "client-bf3", "eng-bf3");
+        let auth = session_for("firm-bf3", "user-bf3");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-bf3".into(),
+                library_control_id: library_control_id(&db, "ITAC-C-001"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+        let benford_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-bf3' AND code = 'ITAC-T-001'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+
+        // 50-row population — well below the 300 minimum.
+        let mut csv = String::from("txn_id,amount\n");
+        for i in 1..=50 {
+            csv.push_str(&format!("{},{}\n", i, 100 + i));
+        }
+
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-bf3".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "transaction_register".into(),
+                filename: "small.csv".into(),
+                mime_type: None,
+                content: csv.into_bytes(),
+            },
+        )
+        .unwrap();
+
+        let result = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: benford_test_id,
+                overrides: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.rule, "benford_first_digit");
+        assert_eq!(result.outcome, "exception");
+        assert_eq!(result.exception_count, 1);
+        assert_eq!(result.digit_rows_evaluated, Some(50));
+
+        db.with(|conn| {
+            let detail: String = conn.query_row(
+                "SELECT detail_json FROM TestResult WHERE id = ?1",
+                params![result.test_result_id],
+                |r| r.get(0),
+            )?;
+            // chi_square is null when the population is too small.
+            assert!(detail.contains("\"chi_square\":null"));
+            Ok(())
+        })
+        .unwrap();
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn run_matcher_chg_sod_flags_users_on_both_deploy_and_source() {
+        // CHG-C-002 ships CHG-T-002 as the dev-vs-deploy SoD procedure.
+        // Deploy permissions: alice, bob, carol. Source access: alice,
+        // dave, eve. Alice is on both — one exception.
+        let (db, db_path) =
+            seeded_db("firm-sod1", "user-sod1", "client-sod1", "eng-sod1");
+        let auth = session_for("firm-sod1", "user-sod1");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-sod1".into(),
+                library_control_id: library_control_id(&db, "CHG-C-002"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+        let sod_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-sod1' AND code = 'CHG-T-002'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-sod1".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "deploy_permissions".into(),
+                filename: "deploy.csv".into(),
+                mime_type: Some("text/csv".into()),
+                content: b"username,role\n\
+                           alice,release-manager\n\
+                           bob,release-manager\n\
+                           carol,release-manager\n"
+                    .to_vec(),
+            },
+        )
+        .unwrap();
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-sod1".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "source_access".into(),
+                filename: "source.csv".into(),
+                mime_type: Some("text/csv".into()),
+                content: b"username,permission\n\
+                           alice,write\n\
+                           dave,write\n\
+                           eve,write\n"
+                    .to_vec(),
+            },
+        )
+        .unwrap();
+
+        let result = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: sod_test_id.clone(),
+                overrides: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.rule, "sod_dev_vs_deploy");
+        assert_eq!(result.outcome, "exception");
+        assert_eq!(result.exception_count, 1);
+        assert_eq!(result.deploy_rows_considered, Some(3));
+        assert_eq!(result.source_rows_considered, Some(3));
+        assert_eq!(result.intersecting_users, Some(1));
+        // SoD uses the supporting-import slot for the source-access export.
+        assert!(result.supporting_import_id.is_some());
+        assert!(result
+            .supporting_import_filename
+            .as_deref()
+            .map(|n| n == "source.csv")
+            .unwrap_or(false));
+        // CHG approval-rule counters should not be set — those belong to
+        // CHG-T-001's rule, not this one. Keep the per-rule blocks distinct.
+        assert!(result.changes_considered.is_none());
+
+        db.with(|conn| {
+            let (outcome, detail): (String, String) = conn.query_row(
+                "SELECT outcome, detail_json FROM TestResult WHERE id = ?1",
+                params![result.test_result_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert_eq!(outcome, "exception");
+            assert!(detail.contains("sod_dev_vs_deploy"));
+            assert!(detail.contains("intersecting_users"));
+
+            let test_status: String = conn.query_row(
+                "SELECT status FROM Test WHERE id = ?1",
+                params![sod_test_id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(test_status, "in_review");
+
+            let activity: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ActivityLog
+                 WHERE engagement_id = 'eng-sod1' AND action = 'matcher_run'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(activity, 1);
+            Ok(())
+        })
+        .unwrap();
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn run_matcher_chg_sod_passes_on_disjoint_permission_lists() {
+        // Deploy permissions and source access are fully disjoint — no
+        // user holds both, so the SoD rule passes with zero exceptions.
+        let (db, db_path) =
+            seeded_db("firm-sod2", "user-sod2", "client-sod2", "eng-sod2");
+        let auth = session_for("firm-sod2", "user-sod2");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-sod2".into(),
+                library_control_id: library_control_id(&db, "CHG-C-002"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+        let sod_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-sod2' AND code = 'CHG-T-002'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-sod2".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "deploy_permissions".into(),
+                filename: "deploy.csv".into(),
+                mime_type: Some("text/csv".into()),
+                content: b"username,role\n\
+                           alice,release-manager\n\
+                           bob,release-manager\n"
+                    .to_vec(),
+            },
+        )
+        .unwrap();
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-sod2".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "source_access".into(),
+                filename: "source.csv".into(),
+                mime_type: Some("text/csv".into()),
+                content: b"username,permission\n\
+                           carol,write\n\
+                           dave,write\n"
+                    .to_vec(),
+            },
+        )
+        .unwrap();
+
+        let result = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: sod_test_id.clone(),
+                overrides: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.rule, "sod_dev_vs_deploy");
+        assert_eq!(result.outcome, "pass");
+        assert_eq!(result.exception_count, 0);
+        assert_eq!(result.deploy_rows_considered, Some(2));
+        assert_eq!(result.source_rows_considered, Some(2));
+        assert_eq!(result.intersecting_users, Some(0));
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn run_matcher_itac_duplicates_flags_exact_repeats() {
+        // ITAC-C-001 ships ITAC-T-002 as the duplicate-transaction procedure.
+        // Seed a population with one exact-triple repeat (Acme, 100.00,
+        // 2024-05-01, posted twice). The matcher should flag a single
+        // duplicate group covering two rows and elevate the test to
+        // in_review.
+        let (db, db_path) =
+            seeded_db("firm-dup1", "user-dup1", "client-dup1", "eng-dup1");
+        let auth = session_for("firm-dup1", "user-dup1");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-dup1".into(),
+                library_control_id: library_control_id(&db, "ITAC-C-001"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+        let dup_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-dup1' AND code = 'ITAC-T-002'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+
+        // Three distinct rows + one exact duplicate of the first row.
+        let csv = "txn_id,amount,counterparty,date\n\
+                   1,100.00,Acme Ltd,2024-05-01\n\
+                   2,250.00,Beta Corp,2024-05-02\n\
+                   3,42.50,Gamma Inc,2024-05-03\n\
+                   4,100.00,Acme Ltd,2024-05-01\n";
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-dup1".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "transaction_register".into(),
+                filename: "txns.csv".into(),
+                mime_type: Some("text/csv".into()),
+                content: csv.as_bytes().to_vec(),
+            },
+        )
+        .unwrap();
+
+        let result = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: dup_test_id.clone(),
+                overrides: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.rule, "duplicate_transactions");
+        assert_eq!(result.outcome, "exception");
+        assert_eq!(result.exception_count, 1);
+        assert_eq!(result.transactions_considered, Some(4));
+        assert_eq!(result.transactions_skipped_unparseable, Some(0));
+        assert_eq!(result.transactions_skipped_zero, Some(0));
+        assert_eq!(result.transactions_skipped_no_key, Some(0));
+        assert_eq!(result.duplicate_group_count, Some(1));
+        assert_eq!(result.total_duplicate_rows, Some(2));
+        // ITAC is a population-level test, no supporting import.
+        assert!(result.supporting_import_id.is_none());
+        assert_eq!(
+            result.primary_import_filename.as_deref(),
+            Some("txns.csv")
+        );
+        // Benford-only counters should remain unset on this rule.
+        assert!(result.digit_rows_evaluated.is_none());
+
+        db.with(|conn| {
+            let (outcome, pop_label, detail): (String, String, String) = conn
+                .query_row(
+                    "SELECT outcome, population_ref_label, detail_json
+                     FROM TestResult WHERE id = ?1",
+                    params![result.test_result_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+            assert_eq!(outcome, "exception");
+            assert!(pop_label.contains("txns.csv"));
+            assert!(detail.contains("duplicate_transactions"));
+            assert!(detail.contains("duplicate_group_count"));
+
+            let test_status: String = conn.query_row(
+                "SELECT status FROM Test WHERE id = ?1",
+                params![dup_test_id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(test_status, "in_review");
+
+            let activity: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ActivityLog
+                 WHERE engagement_id = 'eng-dup1' AND action = 'matcher_run'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(activity, 1);
+            Ok(())
+        })
+        .unwrap();
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn run_matcher_itac_duplicates_passes_on_unique_population() {
+        // Every (amount, counterparty, date) triple is unique — the matcher
+        // passes with zero exceptions.
+        let (db, db_path) =
+            seeded_db("firm-dup2", "user-dup2", "client-dup2", "eng-dup2");
+        let auth = session_for("firm-dup2", "user-dup2");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-dup2".into(),
+                library_control_id: library_control_id(&db, "ITAC-C-001"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+        let dup_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-dup2' AND code = 'ITAC-T-002'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+
+        // Same vendor, same amount, *different* dates → no key collision.
+        let csv = "txn_id,amount,counterparty,date\n\
+                   1,100.00,Acme Ltd,2024-05-01\n\
+                   2,100.00,Acme Ltd,2024-05-08\n\
+                   3,100.00,Acme Ltd,2024-05-15\n";
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-dup2".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "transaction_register".into(),
+                filename: "txns.csv".into(),
+                mime_type: None,
+                content: csv.as_bytes().to_vec(),
+            },
+        )
+        .unwrap();
+
+        let result = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: dup_test_id,
+                overrides: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.rule, "duplicate_transactions");
+        assert_eq!(result.outcome, "pass");
+        assert_eq!(result.exception_count, 0);
+        assert_eq!(result.transactions_considered, Some(3));
+        assert_eq!(result.duplicate_group_count, Some(0));
+        assert_eq!(result.total_duplicate_rows, Some(0));
         cleanup(&db_path);
     }
 }

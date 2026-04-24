@@ -830,8 +830,8 @@ mod tests {
     use super::*;
     use crate::auth::Session;
     use crate::commands::testing::{
-        clone_library_control, run_access_review, upload_data_import,
-        AddLibraryControlInput, RunAccessReviewInput, UploadDataImportInput,
+        clone_library_control, run_matcher, upload_data_import,
+        AddLibraryControlInput, RunMatcherInput, UploadDataImportInput,
     };
     use crate::paths::AppPaths;
 
@@ -989,14 +989,13 @@ mod tests {
             },
         )
         .unwrap();
-        let run = run_access_review(
+        let run = run_matcher(
             db,
             auth,
             paths,
-            RunAccessReviewInput {
+            RunMatcherInput {
                 test_id,
-                ad_import_id: None,
-                leavers_import_id: None,
+                overrides: None,
             },
         )
         .unwrap();
@@ -1106,14 +1105,13 @@ mod tests {
             },
         )
         .unwrap();
-        let run = run_access_review(
+        let run = run_matcher(
             &db,
             &auth,
             &paths,
-            RunAccessReviewInput {
+            RunMatcherInput {
                 test_id,
-                ad_import_id: None,
-                leavers_import_id: None,
+                overrides: None,
             },
         )
         .unwrap();

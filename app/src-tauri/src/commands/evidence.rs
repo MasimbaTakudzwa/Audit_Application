@@ -8,7 +8,7 @@
 //! Auto-created evidence:
 //! - `upload_data_import` creates an Evidence row with `source =
 //!   data_import` so the raw file is browsable from day one.
-//! - `run_access_review` creates an Evidence row with `source =
+//! - `run_matcher` creates an Evidence row with `source =
 //!   matcher_report` linked to the Test and TestResult, and adds
 //!   `TestEvidenceLink` rows pointing at the DataImports that fed the run.
 //!
@@ -855,8 +855,8 @@ mod tests {
     use crate::auth::Session;
     use crate::commands::findings::{elevate_finding, ElevateFindingInput};
     use crate::commands::testing::{
-        clone_library_control, run_access_review, upload_data_import,
-        AddLibraryControlInput, RunAccessReviewInput, UploadDataImportInput,
+        clone_library_control, run_matcher, upload_data_import,
+        AddLibraryControlInput, RunMatcherInput, UploadDataImportInput,
     };
     use crate::paths::AppPaths;
 
@@ -1047,14 +1047,13 @@ mod tests {
         )
         .unwrap();
 
-        let run = run_access_review(
+        let run = run_matcher(
             &db,
             &auth,
             &paths,
-            RunAccessReviewInput {
+            RunMatcherInput {
                 test_id: test_id.clone(),
-                ad_import_id: None,
-                leavers_import_id: None,
+                overrides: None,
             },
         )
         .unwrap();
@@ -1126,14 +1125,13 @@ mod tests {
             },
         )
         .unwrap();
-        let run = run_access_review(
+        let run = run_matcher(
             &db,
             &auth,
             &paths,
-            RunAccessReviewInput {
+            RunMatcherInput {
                 test_id,
-                ad_import_id: None,
-                leavers_import_id: None,
+                overrides: None,
             },
         )
         .unwrap();
@@ -1245,14 +1243,13 @@ mod tests {
             },
         )
         .unwrap();
-        let run = run_access_review(
+        let run = run_matcher(
             &db,
             &auth,
             &paths,
-            RunAccessReviewInput {
+            RunMatcherInput {
                 test_id: test_id.clone(),
-                ad_import_id: None,
-                leavers_import_id: None,
+                overrides: None,
             },
         )
         .unwrap();

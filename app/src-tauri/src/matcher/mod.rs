@@ -8,4 +8,8 @@
 //! keeps it trivially testable.
 
 pub mod access_review;
+pub mod backup;
+pub mod change_management;
 pub mod csv;
+pub mod itac_benford;
+pub mod itac_duplicates;

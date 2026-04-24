@@ -1,11 +1,17 @@
 //! User-access-review rules.
 //!
-//! Two deterministic rules so far, both driven by an AD (or Entra) export:
+//! Three deterministic rules so far, all driven by an AD (or Entra) export:
 //!   - **terminated-but-active** — reconcile the AD export against an HR
 //!     leavers list; flag enabled accounts whose owner appears in the
 //!     leavers list.
 //!   - **dormant-accounts** — flag enabled accounts whose last logon is
 //!     older than a configured threshold (default 90 days).
+//!   - **orphan-accounts** — reconcile the AD export against an HR master
+//!     list of current employees; flag enabled accounts whose owner does
+//!     not appear in the master. Catches accounts left behind when
+//!     employees left before HR recordkeeping was trustworthy, shared
+//!     accounts that escaped the service-account naming convention, and
+//!     (worst case) accounts never backed by a real employee at all.
 //!
 //! Intentional simplicity:
 //!   - Each matcher is pure. It takes parsed tables plus its scalar
@@ -172,6 +178,125 @@ fn is_enabled(row: &Row, column: Option<&str>) -> bool {
         v.as_str(),
         "false" | "0" | "no" | "disabled" | "terminated" | "inactive" | "off"
     )
+}
+
+/// Report for the orphan-accounts rule. Shape mirrors the terminated-but-active
+/// `Report` but the reconciliation runs the other way: an exception is an AD
+/// row that has *no* match in the HR master list. `hr_rows_considered` is the
+/// size of the authoritative master so the auditor can sanity-check that the
+/// HR file covers who they expect.
+#[derive(Debug, Clone, Serialize)]
+pub struct OrphanReport {
+    pub rule: String,
+    pub ad_rows_considered: usize,
+    pub ad_rows_skipped_disabled: usize,
+    pub ad_rows_skipped_unmatchable: usize,
+    pub hr_rows_considered: usize,
+    pub exceptions: Vec<OrphanException>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OrphanException {
+    pub kind: String,
+    pub email: Option<String>,
+    pub logon: Option<String>,
+    pub ad_ordinal: usize,
+    pub ad_row: Vec<String>,
+}
+
+/// Flag enabled AD accounts whose email / logon does not appear anywhere in
+/// the HR master list. The master list is expected to be the authoritative
+/// roster of *current* employees — terminated people belong on the leavers
+/// list consumed by `run_terminated_but_active`, not here.
+///
+/// Matching uses the same email-primary / logon-fallback logic as the
+/// terminated rule; an AD row matches if *either* identifier appears in the
+/// master. This errs toward fewer exceptions: a row that matches on logon but
+/// has an unfamiliar email is treated as "known employee with a renamed
+/// mailbox", not an orphan.
+pub fn run_orphan_accounts(ad: &Table, hr_master: &Table) -> OrphanReport {
+    let ad_email_col = find_column(ad, EMAIL_CANDIDATES);
+    let ad_logon_col = find_column(ad, LOGON_CANDIDATES);
+    let ad_enabled_col = find_column(ad, ENABLED_CANDIDATES);
+
+    let hr_email_col = find_column(hr_master, EMAIL_CANDIDATES);
+    let hr_logon_col = find_column(hr_master, LOGON_CANDIDATES);
+
+    let mut hr_emails: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut hr_logons: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for row in &hr_master.rows {
+        if let Some(col) = &hr_email_col {
+            if let Some(val) = row.values.get(col) {
+                let key = normalise(val);
+                if !key.is_empty() {
+                    hr_emails.insert(key);
+                }
+            }
+        }
+        if let Some(col) = &hr_logon_col {
+            if let Some(val) = row.values.get(col) {
+                let key = normalise(val);
+                if !key.is_empty() {
+                    hr_logons.insert(key);
+                }
+            }
+        }
+    }
+
+    let mut exceptions = Vec::new();
+    let mut skipped_disabled = 0usize;
+    let mut skipped_unmatchable = 0usize;
+
+    for ad_row in &ad.rows {
+        if !is_enabled(ad_row, ad_enabled_col.as_deref()) {
+            skipped_disabled += 1;
+            continue;
+        }
+
+        let ad_email = ad_email_col
+            .as_ref()
+            .and_then(|c| ad_row.values.get(c))
+            .map(|s| normalise(s))
+            .filter(|s| !s.is_empty());
+        let ad_logon = ad_logon_col
+            .as_ref()
+            .and_then(|c| ad_row.values.get(c))
+            .map(|s| normalise(s))
+            .filter(|s| !s.is_empty());
+
+        if ad_email.is_none() && ad_logon.is_none() {
+            skipped_unmatchable += 1;
+            continue;
+        }
+
+        let email_hit = ad_email
+            .as_ref()
+            .map(|e| hr_emails.contains(e))
+            .unwrap_or(false);
+        let logon_hit = ad_logon
+            .as_ref()
+            .map(|l| hr_logons.contains(l))
+            .unwrap_or(false);
+
+        if !(email_hit || logon_hit) {
+            exceptions.push(OrphanException {
+                kind: "orphan_account".into(),
+                email: ad_email,
+                logon: ad_logon,
+                ad_ordinal: ad_row.ordinal,
+                ad_row: ad_row.raw_values.clone(),
+            });
+        }
+    }
+
+    OrphanReport {
+        rule: "orphan_accounts".into(),
+        ad_rows_considered: ad.rows.len(),
+        ad_rows_skipped_disabled: skipped_disabled,
+        ad_rows_skipped_unmatchable: skipped_unmatchable,
+        hr_rows_considered: hr_master.rows.len(),
+        exceptions,
+    }
 }
 
 /// Report for the dormant-accounts rule. Structurally distinct from `Report`
@@ -561,5 +686,132 @@ mod tests {
         assert_eq!(parse_last_logon("1704067200000"), Some(1_704_067_200));
         // Short integer → unparseable for our purposes.
         assert_eq!(parse_last_logon("12345"), None);
+    }
+
+    #[test]
+    fn orphan_flags_ad_accounts_missing_from_hr_master() {
+        // alice and carol are on the master roster; bob is an orphan.
+        let ad = parse(
+            "sAMAccountName,email,enabled\n\
+             alice,alice@acme.com,TRUE\n\
+             bob,bob@acme.com,TRUE\n\
+             carol,carol@acme.com,TRUE\n",
+        )
+        .unwrap();
+        let hr_master =
+            parse("employee_id,email\n1,alice@acme.com\n2,carol@acme.com\n").unwrap();
+
+        let report = run_orphan_accounts(&ad, &hr_master);
+
+        assert_eq!(report.exceptions.len(), 1);
+        assert_eq!(
+            report.exceptions[0].email.as_deref(),
+            Some("bob@acme.com")
+        );
+        assert_eq!(report.exceptions[0].kind, "orphan_account");
+        assert_eq!(report.ad_rows_considered, 3);
+        assert_eq!(report.hr_rows_considered, 2);
+    }
+
+    #[test]
+    fn orphan_skips_disabled_rows_so_they_are_not_exceptions() {
+        // A disabled AD row with no HR match is *not* an orphan — it's just a
+        // disabled stale account, which a dormant/cleanup review handles.
+        let ad = parse(
+            "sAMAccountName,email,enabled\n\
+             alice,alice@acme.com,TRUE\n\
+             ghost,ghost@acme.com,FALSE\n",
+        )
+        .unwrap();
+        let hr_master = parse("employee_id,email\n1,alice@acme.com\n").unwrap();
+
+        let report = run_orphan_accounts(&ad, &hr_master);
+
+        assert!(report.exceptions.is_empty());
+        assert_eq!(report.ad_rows_skipped_disabled, 1);
+    }
+
+    #[test]
+    fn orphan_logon_match_alone_is_enough_when_email_column_missing_in_hr() {
+        // AD has an email column, HR master is logon-only. Matching still
+        // works via the logon fallback.
+        let ad = parse(
+            "sAMAccountName,email,enabled\n\
+             alice,alice@acme.com,TRUE\n\
+             bob,bob@acme.com,TRUE\n",
+        )
+        .unwrap();
+        let hr_master = parse("employee_id,logon_name\n1,alice\n").unwrap();
+
+        let report = run_orphan_accounts(&ad, &hr_master);
+
+        assert_eq!(report.exceptions.len(), 1);
+        assert_eq!(report.exceptions[0].logon.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn orphan_skips_rows_with_neither_email_nor_logon() {
+        // A row that cannot be canonicalised at all can't be checked for
+        // membership; it's counted in ad_rows_skipped_unmatchable, not
+        // exceptions.
+        let ad = parse(
+            "sAMAccountName,email,enabled\n\
+             alice,alice@acme.com,TRUE\n\
+             ,,TRUE\n",
+        )
+        .unwrap();
+        let hr_master = parse("email\nalice@acme.com\n").unwrap();
+
+        let report = run_orphan_accounts(&ad, &hr_master);
+
+        assert!(report.exceptions.is_empty());
+        assert_eq!(report.ad_rows_skipped_unmatchable, 1);
+    }
+
+    #[test]
+    fn orphan_empty_when_every_ad_row_is_in_hr_master() {
+        let ad = parse(
+            "sAMAccountName,email,enabled\n\
+             alice,alice@acme.com,TRUE\n\
+             bob,bob@acme.com,TRUE\n",
+        )
+        .unwrap();
+        let hr_master = parse(
+            "employee_id,email\n\
+             1,alice@acme.com\n\
+             2,bob@acme.com\n\
+             3,carol@acme.com\n",
+        )
+        .unwrap();
+
+        let report = run_orphan_accounts(&ad, &hr_master);
+
+        // HR master being a superset is fine — the rule only checks the AD
+        // side for absence.
+        assert!(report.exceptions.is_empty());
+        assert_eq!(report.hr_rows_considered, 3);
+    }
+
+    #[test]
+    fn orphan_case_and_whitespace_insensitive_matching() {
+        // Email values are trimmed and lower-cased on both sides before
+        // membership check; mixed-case HR data should still match clean AD
+        // data and vice versa.
+        let ad = parse(
+            "sAMAccountName,email,enabled\n\
+             alice,Alice@Acme.com,TRUE\n\
+             bob,  bob@acme.com  ,TRUE\n",
+        )
+        .unwrap();
+        let hr_master = parse(
+            "employee_id,email\n\
+             1,ALICE@ACME.COM\n\
+             2,bob@acme.com\n",
+        )
+        .unwrap();
+
+        let report = run_orphan_accounts(&ad, &hr_master);
+
+        assert!(report.exceptions.is_empty());
     }
 }

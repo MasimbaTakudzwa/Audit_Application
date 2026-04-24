@@ -23,8 +23,14 @@
     | "entra_export"
     | "hr_active"
     | "hr_leavers"
+    | "hr_master"
     | "payroll"
     | "badge_log"
+    | "change_log"
+    | "backup_log"
+    | "transaction_register"
+    | "deploy_permissions"
+    | "source_access"
     | "other";
 
   const PURPOSE_OPTIONS: { id: PurposeTag; label: string; hint: string }[] = [
@@ -32,16 +38,31 @@
     { id: "entra_export",label: "Entra export",    hint: "Azure AD / Entra user dump" },
     { id: "hr_active",   label: "HR active list",  hint: "Employees currently on payroll" },
     { id: "hr_leavers",  label: "HR leavers list", hint: "Terminated or departed employees" },
+    { id: "hr_master",   label: "HR master roster", hint: "Authoritative list of current employees (for orphan-account checks)" },
     { id: "payroll",     label: "Payroll run",     hint: "Payroll register for the period" },
     { id: "badge_log",   label: "Badge / access log", hint: "Physical access or entry log" },
+    { id: "change_log",  label: "Change log",      hint: "Change-management export (ServiceNow, Jira, Remedy, …)" },
+    { id: "backup_log",  label: "Backup log",      hint: "Backup-tool job history (Veeam, Commvault, Rubrik, …)" },
+    { id: "transaction_register", label: "Transaction register", hint: "Export of the in-scope transaction population, with an amount column" },
+    { id: "deploy_permissions", label: "Deploy permissions", hint: "Production deployment tool's role or permission matrix (for dev-vs-deploy SoD)" },
+    { id: "source_access", label: "Source repository access", hint: "Source host or change-authoring tool's access export (for dev-vs-deploy SoD)" },
     { id: "other",       label: "Other",           hint: "Any other evidence you want to retain" },
   ];
 
   // Test codes for which the backend has a dispatchable matcher today. Keep
-  // this list in sync with `AccessReviewRule::for_test_code` in Rust — any
-  // code in here must also be dispatchable there, or the button will error
-  // when pressed.
-  const MATCHER_ENABLED_CODES = new Set(["UAM-T-001", "UAM-T-003"]);
+  // this list in sync with `MatcherRule::for_test_code` in Rust — any code
+  // in here must also be dispatchable there, or the button will error when
+  // pressed.
+  const MATCHER_ENABLED_CODES = new Set([
+    "UAM-T-001",
+    "UAM-T-003",
+    "UAM-T-004",
+    "CHG-T-001",
+    "CHG-T-002",
+    "BKP-T-001",
+    "ITAC-T-001",
+    "ITAC-T-002",
+  ]);
 
   let loading = $state(true);
   let err = $state("");
@@ -277,10 +298,9 @@
     runningTestId = test.id;
     runErr = "";
     try {
-      await api.engagementRunAccessReview({
+      await api.engagementRunMatcher({
         test_id: test.id,
-        ad_import_id: null,
-        leavers_import_id: null,
+        overrides: null,
       });
       const [refreshedTests, refreshedResults, refreshedEvidence] = await Promise.all([
         api.engagementListTests(engagement.id),

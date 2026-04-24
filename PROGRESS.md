@@ -8,9 +8,9 @@ Entries are reverse-chronological. Most recent first.
 
 ## Current state
 
-**Phase**: First real vertical slice live — User Access Review (Module 6/7/8 ribbon) — plus Evidence (Module 7) browsable chain of custody and a per-test Working Paper view with CCCER-shaped finding editing. From an engagement detail page an auditor can add a library control (clones risks + tests into the engagement), upload an AD export and an HR leavers list as encrypted `DataImport`s, run a rule-based matcher — `UAM-T-001` (terminated-but-active) or `UAM-T-003` (dormant accounts) — to produce a `TestResult`, elevate exceptions to a draft `Finding` with severity, drill into the test's Working Paper to see control context + run history + findings (condition / criteria / cause / effect / recommendation) + test-scoped evidence, and browse every raw upload, matcher report, and free-form attachment in the engagement-level Evidence table. All mutations are attributable (SyncRecord + ChangeLog + ActivityLog + EvidenceProvenance) and cross-firm isolated.
+**Phase**: First real vertical slice live — the Module 6/7/8 ribbon (fieldwork → evidence → findings) now spans four ITGC/ITAC families with eight wired rules. From an engagement detail page an auditor can add a library control (clones risks + tests into the engagement), upload encrypted `DataImport`s tagged by purpose, and run a rule-based matcher — `UAM-T-001` (terminated-but-active), `UAM-T-003` (dormant accounts), `UAM-T-004` (orphan accounts), `CHG-T-001` (change-management approval-before-deployment), `CHG-T-002` (dev-vs-deploy segregation-of-duties), `BKP-T-001` (backup performance), `ITAC-T-001` (Benford's-Law first-digit analysis on a transaction population), or `ITAC-T-002` (duplicate-transaction detection on a transaction population) — to produce a `TestResult`, elevate exceptions to a draft `Finding` with severity, drill into the test's Working Paper to see control context + run history + CCCER findings (condition / criteria / cause / effect / recommendation) + test-scoped evidence, and browse every raw upload, matcher report, and free-form attachment in the engagement-level Evidence table. All matchers flow through one generic `run_matcher` dispatcher with a `purpose_tag → DataImport.id` override map. All mutations are attributable (SyncRecord + ChangeLog + ActivityLog + EvidenceProvenance) and cross-firm isolated.
 
-Earlier foundations remain: authentication + encrypted DB, Ed25519-verified library baseline (now v0.1.0 + v0.2.0), Clients / Engagements CRUD, and the Library browse route.
+Earlier foundations remain: authentication + encrypted DB, Ed25519-verified library baseline (now v0.1.0 + v0.2.0 + v0.3.0 + v0.4.0 + v0.5.0), Clients / Engagements CRUD, and the Library browse route.
 
 **Repo / scaffolding**: Git initialised at project root. Toolchain installed (Rust 1.95 stable, Node 25). See `SETUP.md` for how to run.
 
@@ -40,12 +40,13 @@ Earlier foundations remain: authentication + encrypted DB, Ed25519-verified libr
 
 **Immediate next up**:
 
-1. **More rule matchers** — change-management (`CHG-T-001`) and backup (`BKP-T-001`) are the next two to ship. Same dispatcher-through-rule-variant pattern as the two UAR rules. Orphan-accounts (AD rows with no matching HR master) is the other natural UAR extension.
-2. **Review-note annotations on the working paper** — inline margin notes on a test that reviewers can tick to clear, preserving the audit trail. Working Paper route is in place; this adds the review layer on top.
-3. **Attach-evidence-to-finding UI** — `finding_attach_evidence` / `finding_detach_evidence` are wired and tested; surface them from the CCCER editor so auditors can cite specific evidence per finding without leaving the working paper.
-4. **Schema cleanup** — drop `User.argon2_hash` and `User.master_key_wrapped` (future migration). Authoritative copies live in `identity.json`.
-5. **Password change UI** — the `change_password` command is already registered; Settings needs a form that calls it.
-6. **Zeroise master key in memory** — add `ZeroizeOnDrop` to the MK buffer before it reaches SQLCipher. Defensive; not a known leak.
+1. **More rule matchers** — UAR carries three rules, CHG two, BKP one, ITAC two. Next natural extensions: boundary / rounding analysis for ITAC (third ITAC rule; flags transactions bunched just below approval thresholds or rounded to suspiciously round totals), a periodic-recertification matcher for UAM-T-002 (currently un-wired and rejected by dispatch), and a privileged-access review for UAR (fourth UAR rule, reconciling AD "Domain Admins" or application "sysadmin" membership against an approver-list snapshot).
+2. **Matcher override picker UI** — the backend accepts an arbitrary `overrides: Record<purpose_tag, data_import_id>` map; the UI currently always sends `null`, so the command picks the newest matching import per tag. Picker appears when auditors start asking "run this against last quarter's export".
+3. **Review-note annotations on the working paper** — inline margin notes on a test that reviewers can tick to clear, preserving the audit trail. Working Paper route is in place; this adds the review layer on top.
+4. **Attach-evidence-to-finding UI** — `finding_attach_evidence` / `finding_detach_evidence` are wired and tested; surface them from the CCCER editor so auditors can cite specific evidence per finding without leaving the working paper.
+5. **Schema cleanup** — drop `User.argon2_hash` and `User.master_key_wrapped` (future migration). Authoritative copies live in `identity.json`.
+6. **Password change UI** — the `change_password` command is already registered; Settings needs a form that calls it.
+7. **Zeroise master key in memory** — add `ZeroizeOnDrop` to the MK buffer before it reaches SQLCipher. Defensive; not a known leak.
 
 **Library follow-ups** (do when they become load-bearing, not before):
 
@@ -56,6 +57,241 @@ Earlier foundations remain: authentication + encrypted DB, Ed25519-verified libr
 ---
 
 ## Decision log
+
+### 2026-04-24 — Duplicate-transaction detection matcher (ITAC-T-002) shipped
+
+Second ITAC rule lands: an exact-triple duplicate detector that groups a transaction population by `(amount, counterparty, date)` and flags every group containing two or more rows. Designed for accounts-payable and accounts-receivable duplication review — genuine business activity rarely produces identical postings on the same day to the same counterparty for the same amount, so any such cluster is an investigation lead (double-posted invoice, duplicated manual journal, fabricated record with a copy-pasted row). Not a fuzzy-match engine: two rows with slightly different vendor spellings or adjacent dates stay unflagged, by design. Fuzzy duplication is a separate, heavier test and needs either a firm-provided alias table or a vendor-normalisation layer — both out of scope for the first pass.
+
+**Complements Benford, doesn't overlap it.** `ITAC-T-001` asks "does the population's leading-digit distribution look natural?" from first principles. `ITAC-T-002` asks "are there exact repeats the population shouldn't contain?" from pairwise equality. The two share the same input (`transaction_register` purpose tag) and the same library control (`ITAC-C-001`, analytical plausibility testing), so the auditor can run both in sequence on the same upload and they surface different symptoms of the same concern. Reusing the purpose tag also means no new PurposeTag enum entry is needed on the frontend.
+
+**Library v0.5.0** (`app/src-tauri/resources/library/v0.5.0.json`):
+- Full carry-forward of v0.4.0 (4 risks, 6 controls, 8 test procedures) plus one new test procedure: `ITAC-T-002` "Duplicate-transaction detection on transaction population" under the existing `ITAC-C-001` control. `sampling_default: "none"` (population-level test), `automation_hint: "rule-based"`. Six-step test narrative mirrors the Benford procedure's flow (obtain → confirm completeness → run matcher → investigate each flagged group → escalate per policy → record exception).
+- Signed via `tools/sign-library-bundle/` against `~/.config/audit-app/signing/library.key`. Loader adds `BUNDLE_V0_5_0` / `BUNDLE_V0_5_0_SIG` as the fifth `install_bundle` call. `baseline_bundle_loads_into_fresh_db` extended to assert v0.5.0 shape (4 risks / 6 controls / 9 test procedures / 9 checklists / 12 framework mappings) and that v0.4.0's rows are now superseded.
+
+**Pure matcher** (`app/src-tauri/src/matcher/itac_duplicates.rs`, ~430 lines):
+- `run_duplicate_transactions(transactions: &Table) -> DuplicateReport`. Iterates rows, parses amount + counterparty + date, builds a grouping key, and accumulates rows into a `BTreeMap<(amount_cents, counterparty_key, date), GroupAccum>` keyed by `(i64, String, String)` — BTreeMap is deliberate so exception iteration order is stable across runs, same pattern as the SoD rule's `intersection_keys.sort()`.
+- `DuplicateReport { rule: "duplicate_transactions", rows_considered, rows_skipped_unparseable, rows_skipped_zero, rows_skipped_no_key, duplicate_group_count, total_duplicate_rows, exceptions: Vec<DuplicateException> }`. `DuplicateException { kind: "duplicate_transaction_group", display_amount, amount_cents, counterparty, display_counterparty, date, row_count, row_ordinals, sample_rows }`. Sample rows capped at `SAMPLE_ROWS_PER_GROUP = 5` to keep the report a reasonable size on pathological populations. `amount_cents` is the integer grouping key; `display_amount` is the first-seen raw string — the auditor sees the shape the client exported.
+- `COUNTERPARTY_CANDIDATES` (24 headers: `counterparty`, `vendor`, `vendorname`, `supplier`, `customer`, `payee`, `account`, `party`, `name`, `entity`, `beneficiary`, `merchant`, `description`, etc.) and `DATE_CANDIDATES` (20 headers: `date`, `transaction_date`, `posting_date`, `posted_on`, `invoice_date`, `document_date`, `gl_date`, etc.). Kept broad because ERP exports, payments-platform reports, and accounting-package dumps all spell the columns differently.
+- **Shared currency parser**: exposed `parse_amount` and `AMOUNT_CANDIDATES` as `pub(super)` in `matcher/itac_benford.rs`. `itac_duplicates` imports them so the same currency-symbol / ISO-code / parentheses-negative / thousands-separator handling works identically for both rules. Avoids ~50 lines of duplicated parsing logic and prevents the two rules from drifting apart on edge cases like `(1,234.56)` or `USD 100.00`.
+- **Integer-cents key**: amounts are converted via `(amount.abs() * 100.0).round() as i64` before use in the grouping tuple. Float keys would alias via `NaN` and precision issues; `-100.00` and `100.00` collapse to the same magnitude bucket (sign is considered deliberately out of scope for "two postings of the same amount" — a reversal paired with an original posting is itself a duplicate worth investigating).
+- **Normalisation**: counterparty matched case-insensitively and whitespace-collapsed. Date strings compared *as the source provided them* — mixing `2024-05-01` with `05/01/2024` does not merge the two into one group. This is restrictive by design: parsing dates into a canonical form would require the auditor to resolve regional ambiguity (US vs EU) and mask genuine data-quality issues; comparing verbatim means the matcher reports exactly what's in the export.
+- 15 unit tests: flags exact pair, flags group of three, passes on fully-unique population, same amount + vendor but different dates do *not* merge, header-variant normalisation, amount with `$` + commas normalises for match, different vendors at same amount + date are not duplicates, zero amounts skipped, missing counterparty or missing date counted as `rows_skipped_no_key`, unparseable amounts counted but never grouped, counterparty match case-insensitive, mixed date formats stay separate, absolute-value sign handling, sample rows cap at 5, deterministic exception ordering. All 15 pass.
+
+**Command layer** (`app/src-tauri/src/commands/testing.rs`):
+- `MatcherRule::ItacDuplicateTransactions` added; `for_test_code` routes `ITAC-T-002 → ItacDuplicateTransactions`; dispatch branch calls `run_itac_duplicate_transactions`.
+- `run_itac_duplicate_transactions` mirrors the Benford helper's single-input shape: resolve the population via `transaction_register` / `transactions` / `gl_export` / `primary` purpose-tag aliases (same list as Benford — the two rules share the upload), `load_csv_table`, call the pure matcher, build a two-variant summary ("N duplicate groups covering X rows across Y considered rows" / "No duplicate transactions found across Y considered rows"), JSON detail carrying all 7 counters, `RuleOutcome::base(..., "IT application controls", "itac-duplicates", ..., "Transaction register")`, `supporting_import = None` (population-level, single input), plus the three new counters.
+- Three new `Option<i64>` fields on `RuleOutcome` and on `MatcherRunResult` (and `tauri.ts` mirror): `transactions_skipped_no_key`, `duplicate_group_count`, `total_duplicate_rows`. Re-uses the existing `transactions_considered` / `transactions_skipped_unparseable` / `transactions_skipped_zero` counters from the ITAC family block — those semantics are identical across the two rules (a parseable non-zero monetary amount on a transaction row). Slotted directly after the Benford fields with a comment noting the rule they belong to so future readers don't mistakenly reuse `duplicate_group_count` for another rule's similarly-shaped output.
+- Two integration tests: `run_matcher_itac_duplicates_flags_exact_repeats` (4-row population with one duplicate pair → `outcome="exception"`, `exception_count=1`, `duplicate_group_count=1`, `total_duplicate_rows=2`, Benford-only counters remain `None`, `ActivityLog` shows one `matcher_run`) and `run_matcher_itac_duplicates_passes_on_unique_population` (3 rows with same vendor + amount but different dates → `outcome="pass"`, `exception_count=0`, `duplicate_group_count=Some(0)`). Both pass.
+
+**Frontend** (`app/src-tauri/src/lib/api/tauri.ts`, `app/src/lib/routes/EngagementDetail.svelte`, `app/src/lib/routes/WorkingPaper.svelte`):
+- Three new `number | null` fields on `MatcherRunResult` in `tauri.ts` under a "Duplicate-transaction detection (ITAC-T-002)" comment block, mirroring the backend additions.
+- `ITAC-T-002` added to `MATCHER_ENABLED_CODES` in both engagement-detail and working-paper routes — the "Run matcher" button now appears for the duplicate-detection test just as it does for Benford.
+- **No new PurposeTag entry needed.** The duplicate rule consumes the same `transaction_register` tag the Benford rule already registered. `PURPOSE_OPTIONS` unchanged.
+
+**Verified**: `cargo test --lib` 143 passing (128 before this rule + 15 new `itac_duplicates` unit tests + 2 new integration tests = 143; library-loader assertions updated in place, no baseline regressions). `npm run check` 94 files 0 errors 0 warnings. `npm run build` 132.15 KB / gzip 40.78 KB (+30 bytes over Benford-only — three new interface fields and an enable-set entry, no new runtime code). Chrome DevTools / e2e deferred until the picker UI arrives — today's work is pure backend + interface contract.
+
+**Three design calls worth keeping:**
+1. **Exact-form duplicate detection, not fuzzy.** Two rows must match on all three of normalised amount, normalised counterparty, and verbatim date string. Fuzzy vendor matching, near-date bucketing, and amount-tolerance windows are separate, heavier tests that need configuration the baseline can't assume (vendor alias tables, tolerance thresholds, locale-specific date parsers). The exact form is still a genuinely useful audit signal on its own — double-postings and copy-paste fabrication almost always produce exact triples — and it's cheap to run.
+2. **Absolute value for amount match.** `(-100.00, Acme, 2024-05-01)` matches `(100.00, Acme, 2024-05-01)` and is flagged as a pair. An original posting + its reversal *is* a duplicate in the sense the rule is looking for: if both exist on the same day to the same counterparty, the reversal should have cancelled the original, and the fact that both survived is the signal. Firms that want signed matching can filter afterwards — easier than trying to unflag here.
+3. **Date verbatim, not parsed.** The matcher compares `"2024-05-01"` to `"2024-05-01"` directly and will not merge `"2024-05-01"` with `"05/01/2024"`. Parsing dates into a canonical form is a minefield across US/EU formats, Excel serials, timezone-stripped timestamps, and locale-specific month names — the safest default is "trust the client's export". If the same date appears in two different forms within one population, that's itself a data-quality issue worth flagging separately, not masking here.
+
+**Deferred (explicitly not in scope)**:
+- **Fuzzy counterparty / near-date duplicate detection** — needs firm-configurable thresholds or an alias table. Would land as `ITAC-T-00X` if ever prioritised.
+- **Cross-period duplicate detection** — the rule only sees one upload at a time. Year-over-year "this vendor received the same payment on the same day last year" needs the recurring-finding infrastructure that's already on the roadmap, not this matcher.
+- **Amount-tolerance windows** (e.g. "flag groups within 1% of each other") — same issue: needs configuration and moves the test from "exact repeats" to "suspicious clusters". Different test code entirely.
+- **Counterparty aliasing / normalisation beyond trim+lower** — "Acme Ltd." vs "ACME LIMITED" stay separate until the firm provides an alias table. The matcher deliberately doesn't pretend to resolve identity.
+
+**Files of note**:
+- `app/src-tauri/src/matcher/itac_duplicates.rs` — new matcher module
+- `app/src-tauri/src/matcher/mod.rs` — registered `pub mod itac_duplicates;`
+- `app/src-tauri/src/matcher/itac_benford.rs` — `parse_amount` + `AMOUNT_CANDIDATES` promoted to `pub(super)` for sibling-module reuse
+- `app/src-tauri/resources/library/v0.5.0.json` (+ `.sig`) — new library bundle
+- `app/src-tauri/src/library/loader.rs` — fifth bundle installed; test updated
+- `app/src-tauri/src/commands/testing.rs` — `MatcherRule::ItacDuplicateTransactions`, dispatcher, `run_itac_duplicate_transactions`, three new `RuleOutcome` + `MatcherRunResult` fields, two integration tests
+- `app/src/lib/api/tauri.ts` — three new `MatcherRunResult` fields
+- `app/src/lib/routes/EngagementDetail.svelte`, `app/src/lib/routes/WorkingPaper.svelte` — `ITAC-T-002` in `MATCHER_ENABLED_CODES`
+
+---
+
+### 2026-04-24 — Dev-vs-deploy segregation-of-duties matcher (CHG-T-002) shipped
+
+Second CHG rule lands: a structural segregation-of-duties check that reconciles the production-deployment tool's permission list against the source repository's write-access list. Any user appearing in both holds "deploy-to-production" and "author-a-change" capabilities simultaneously and could push their own code without review. The matcher flags the intersection; the auditor inspects each user and confirms either (a) they have since been removed from one side, or (b) a documented compensating control (four-eyes review, post-deployment monitoring) operated during the period. It does not try to identify compensating controls itself — that's evidence-based, not data-driven.
+
+Distinct from CHG-T-001's existing per-change `approver_is_implementer` exception: that asks "did anyone bypass review on *this* deployed change?" from the change-log record itself. CHG-T-002 asks the wider structural question "who *could* bypass review across the whole period?" from the permission matrices. Overlap is a feature — the two surface different symptoms of the same control gap.
+
+**No library bundle change.** `CHG-T-002` and its parent control `CHG-C-002` already shipped in v0.4.0 alongside the Benford rule. The library entry was already signed, loaded, and covered by the `baseline_bundle_loads_into_fresh_db` test; today's change is purely the matcher + command-layer wiring + integration tests + frontend enable. Smallest possible incremental backend change to activate an already-frozen library spec.
+
+**Pure matcher** (`app/src-tauri/src/matcher/change_management.rs`):
+- `run_sod_dev_vs_deploy(deploy_access: &Table, source_access: &Table) -> SoDReport`. Builds two `HashMap<username_key, (ordinal, raw_row)>` maps, intersects the keys, emits one `SoDException` per user in the intersection with the first-occurrence ordinal from each side.
+- `SoDReport { rule, deploy_rows_considered, deploy_rows_skipped_unmatchable, source_rows_considered, source_rows_skipped_unmatchable, deploy_unique_users, source_unique_users, intersecting_users, exceptions: Vec<SoDException> }`. `SoDException { kind: "user_has_dev_and_deploy", username, deploy_row, source_row, deploy_ordinal, source_ordinal }`. Username on the exception is the *normalised* key (trimmed, lower-cased); the two raw rows preserve the auditor's original CSV columns for reviewing the context.
+- `SOD_USERNAME_CANDIDATES` covers 21 plausible column headers — `user`, `username`, `login`, `samaccountname`, `principal`, `email`, `upn`, `member`, `developer`, etc. Kept deliberately broad since deploy tools, CI/CD platforms, source hosts, and IAM exports all spell the identity column differently. Match on canonicalised headers (lower-cased, `_` / `-` / space stripped), same as every other matcher in the module.
+- Normalisation is trim + lower-case only. Cross-form identity mapping (display name vs email vs SAM account) is deliberately out of scope — that needs a firm-provided alias table, not heuristics. Intersection keys are sorted before emission so exception ordering is stable across runs.
+- Dedup within one side: a user who appears on multiple deploy rows (two release-manager groups, say) counts once in `deploy_unique_users` and produces at most one exception. First occurrence's ordinal and raw row are kept.
+- Seven unit tests in the same file: happy path (1 intersection across disjoint rest), disjoint pass path, case + whitespace-insensitive matching, rows with missing username counted as skipped, within-side dedup, deterministic exception ordering, header-variant normalisation.
+
+**Command layer** (`app/src-tauri/src/commands/testing.rs`):
+- `MatcherRule::ChgSodDevVsDeploy` added; `for_test_code` routes `CHG-T-002 → ChgSodDevVsDeploy`; dispatch branch calls `run_chg_sod_dev_vs_deploy`.
+- `run_chg_sod_dev_vs_deploy` mirrors the two-input reconciliation shape used by `run_uar_terminated_but_active` and `run_uar_orphan_accounts`: resolve the deploy export via `deploy_permissions` / `deployment_access` / `primary` purpose-tag aliases, resolve the source export via `source_access` / `source_repo_access` / `supporting` aliases, `load_csv_table` both, call the pure matcher, build a two-variant summary ("N users with both deploy-to-production and source-write access" / "No SoD overlap across X deploy-permission rows and Y source-access rows"), JSON detail with all counters + both unique-user counts, `RuleOutcome::base(..., "Change management", "change-management-sod", ..., "Deployment permission export")`, `supporting_import = Some(source_import)`, plus the five new counters.
+- Five new `Option<i64>` fields on `RuleOutcome` and on `MatcherRunResult` (and `tauri.ts` mirror): `deploy_rows_considered`, `deploy_rows_skipped_unmatchable`, `source_rows_considered`, `source_rows_skipped_unmatchable`, `intersecting_users`. Slotted under a new "CHG SoD (dev-vs-deploy)" sub-block inside the CHG family block, labelled with a comment noting "two permission-list inputs, not a change log" so future readers don't try to reuse the change-log counters for this rule.
+- `report_kind_slug = "change-management-sod"` — distinct from CHG-T-001's `"change-management"` slug so the persisted report blobs can be told apart. Report filenames become `change-management-sod-CHG-T-002.json` versus `change-management-CHG-T-001.json`.
+- Two integration tests: `run_matcher_chg_sod_flags_users_on_both_deploy_and_source` (three deploy users × three source users × one overlap → one exception; asserts `rule: "sod_dev_vs_deploy"`, `outcome: "exception"`, all five new counters populated, `supporting_import_filename == "source.csv"`, Test flips to `in_review`, `ActivityLog.matcher_run` fires once, detail JSON contains both `"sod_dev_vs_deploy"` and `"intersecting_users"`, CHG approval-family counters stay `None`); `run_matcher_chg_sod_passes_on_disjoint_permission_lists` (disjoint lists → zero exceptions, `outcome: "pass"`, `intersecting_users: Some(0)`).
+
+**Frontend** (`app/src/lib/api/tauri.ts`, `app/src/lib/routes/{EngagementDetail,WorkingPaper}.svelte`):
+- Five new `number | null` fields on `MatcherRunResult`, slotted under a new "CHG SoD (dev-vs-deploy)" comment inside the CHG family block.
+- `MATCHER_ENABLED_CODES` gets `"CHG-T-002"` in both routes.
+- EngagementDetail's `PurposeTag` gets `"deploy_permissions"` and `"source_access"`; `PURPOSE_OPTIONS` grows two matching rows ("Deploy permissions — Production deployment tool's role or permission matrix" / "Source repository access — Source host or change-authoring tool's access export"). Auditors tag the files at upload time; the override picker UI is still deferred (`overrides: null` from the run button).
+- No new Working Paper counter surfaced — existing UI shows `rule`, `outcome`, and `exception_count`; per-user intersection lives in the JSON detail blob and the downloadable report.
+
+**Verified**:
+- `cargo test --lib` — 126 passing (up from 117 after Benford). Seven new unit tests in `matcher::change_management::tests::sod_*`, two new integration tests in `commands::testing::tests::run_matcher_chg_sod_*`.
+- `npm run check` — 94 files, 0 errors, 0 warnings.
+- `npm run build` — clean vite bundle (~132.12 KB, gzip ~40.77 KB).
+
+**Design call — the rule stops at "who's in both sets"**: identifying *which* overlaps have an acceptable compensating control is evidence-based, not data-driven, and deliberately outside the matcher's scope. The exception list is the *auditor-facing* follow-up queue; each user gets individually reviewed, and the disposition goes in the working paper's CCCER, not the matcher report.
+
+**Design call — exact-form normalisation only**: usernames match on trim + lower-case. If the deploy tool exports "Alice Example" and the source host exports "alice@example.com", the matcher won't bridge that — firms need an identity alias table for cross-form matching, which is a separate feature. Keeping the rule strict limits false positives at the cost of requiring auditors to upload exports with comparable identifier columns.
+
+**Design call — distinct from CHG-T-001's `approver_is_implementer`**: the existing CHG-T-001 rule already flags same-person-approved-and-deployed on individual change records. CHG-T-002 asks the structural question across the period. Both rules can fire; overlap is expected and informative.
+
+**Deliberately deferred**:
+- Cross-form identity matching (email ↔ SAM account ↔ display name) via a firm-provided alias table.
+- Compensating-control registry — today the auditor documents compensating controls in the working-paper CCCER free text. A structured registry (per user, with effective dates) is a later schema addition.
+- Override picker UI. Still `null`.
+- Privileged-access-review (the "who holds Domain Admins?" question) is shaped similarly to this rule — permission snapshot × approver list — but deliberately tracked as the next UAR rule rather than bolted onto the CHG family.
+
+**Files of note**: `app/src-tauri/src/matcher/change_management.rs` (+~180 lines for the SoD rule + tests), `app/src-tauri/src/commands/testing.rs` (new dispatch branch + helper + 5 new counters + 2 integration tests), `app/src/lib/api/tauri.ts`, `app/src/lib/routes/EngagementDetail.svelte`, `app/src/lib/routes/WorkingPaper.svelte`.
+
+### 2026-04-24 — Benford's-Law first-digit matcher (ITAC-T-001) shipped, ITAC family opens
+
+First IT application controls rule lands, opening a new ITGC/ITAC family alongside UAR / CHG / BKP. The matcher takes an exported transaction population and tests whether its leading-digit distribution follows Benford's Law — the empirical regularity that in naturally-occurring numeric data, digit `d` appears as the leading non-zero digit with frequency `log10(1 + 1/d)`. Finance, expense, and revenue populations that are fabricated, rounded to clean thresholds, or selectively omitted tend to deviate visibly. A clean population clears the test in seconds; a flagged one points the auditor at which digit is over- or under-represented before they start asking targeted questions.
+
+Deliberately shipped as the ITAC opener because it's the most general-purpose test in the family (any numeric population with a reasonable magnitude spread qualifies: GL entries, expense claims, revenue line items, inventory receipts) and it's entirely deterministic — no ML, no LLM, no sampling. Fits the rules-first automation tier cleanly.
+
+**Pure matcher** (`app/src-tauri/src/matcher/itac_benford.rs`, new module):
+- Exports `BenfordReport { rule, rows_considered, rows_skipped_unparseable, rows_skipped_zero, digit_rows_evaluated, digit_counts: [u64; 9], digit_observed_frequencies: [f64; 9], digit_expected_frequencies: [f64; 9], chi_square: Option<f64>, chi_square_critical: f64, digit_deviation_threshold: f64, min_digit_rows: usize, exceptions: Vec<BenfordException> }` and `BenfordException { kind, digit, observed_frequency, expected_frequency, deviation, note }`. Three exception discriminators: `population_too_small` (digit count below the chi-square threshold), `digit_frequency_anomaly` (per-digit observed-vs-expected gap), `chi_square_exceeds_critical` (global goodness-of-fit failure when no single digit breached the per-digit threshold).
+- Constants: `EXPECTED_FREQUENCIES: [f64; 9]` (Benford's law P(d) = log10(1 + 1/d) for d ∈ 1..9), `CHI_SQUARE_CRITICAL_DF8_ALPHA05 = 15.507` (hardcoded critical value at 8 degrees of freedom, α = 0.05 — avoids pulling in a p-value library), `DIGIT_DEVIATION_THRESHOLD = 0.02` (2 percentage points), `MIN_DIGIT_ROWS = 300` (population-size floor below which chi-square is not meaningful).
+- `parse_amount` handles the messy input shapes Simba expects from real African-market exports: currency symbols (`$`, `£`, `€`, `¥`, `₦`, `R`, `Z$`), ISO codes (`USD`, `EUR`, `ZAR`, `ZWL`, `NGN`, `KES`, ...), thousands separators (`,`, space, `'`), parenthesised-negative accounting convention (`(150) = -150`), and `CR` / `DR` trailing suffixes. `leading_digit` takes the absolute value and scales it into `[1, 10)` by repeated ×10 / ÷10 until a truncated integer falls in `1..=9` — handles `0.000732` (→ 7) and `8.4e6` (→ 8) identically.
+- `run_benford_first_digit(&Table)`:
+  - Iterates the amount column (auto-detected from the usual suspects: `amount`, `value`, `net`, `total`, ...), counts `rows_skipped_unparseable` and `rows_skipped_zero` (Benford does not apply to zeros).
+  - If `digit_rows_evaluated < 300` → single `population_too_small` exception, `chi_square: None`, no digit-level work.
+  - Otherwise computes chi-square, emits one `digit_frequency_anomaly` per digit with `|observed − expected| > 0.02`.
+  - If chi-square > 15.507 but no per-digit rule fired, falls through to a single `chi_square_exceeds_critical` exception — the distribution is globally off even though no single digit stands out.
+- Ten unit tests: pure-Benford population passes, uniform distribution fails (each digit contributes), population-too-small shortcircuits before chi-square, currency-symbol parsing, paren-negative parsing, CR/DR suffix parsing, leading-digit scaling (both small and large magnitudes), empty-amount-column handling, zero-only column handling, and the `chi_square_exceeds_critical` fallthrough shape.
+
+**Library v0.4.0** (`app/src-tauri/resources/library/v0.4.0.json` + `.sig`):
+- Full carry-forward: v0.3.0's 3 risks / 5 controls / 7 test procedures re-emitted, plus `ITAC-R-001` ("Transaction records are fabricated, manipulated, or selectively omitted during entry or reporting"), `ITAC-C-001` ("Transaction populations are subjected to analytical plausibility testing", COBIT 2019 DSS06.01 / NIST CSF DE.AE-2), and `ITAC-T-001` ("Benford's Law first-digit analysis on transaction population", `sampling_default: "none"`, `automation_hint: "rule-based"`, four-item evidence checklist: transaction register export, amount column definition, Benford report output, follow-up documentation for any flagged digits). Published-at epoch 1777032000 (2026-04-24 12:00:00 UTC), sitting twelve hours after v0.3.0's 1776988800.
+- Same carry-forward reasoning as v0.3.0 — `control_code_to_id` is populated intra-bundle only, `current_library_version` uses `MAX(library_version) WHERE superseded_by IS NULL`, so a thin "ITAC-only" bundle would leave prior UAR/CHG/BKP rows un-superseded and broken. The convention is now established: every library bundle re-emits every prior entity.
+- Signed via the `tools/sign-library-bundle/` CLI against `~/.config/audit-app/signing/library.key`. Baked into `library/loader.rs` as `BUNDLE_V0_4_0` + `BUNDLE_V0_4_0_SIG` via `include_bytes!` / `include_str!`, installed as the fourth `install_bundle` call in `install_baseline_bundles`. The `baseline_bundle_loads_into_fresh_db` test grew to assert the v0.4.0 shape: 4 risks current, 6 controls, 8 test procedures, 8 checklists, 12 framework mappings; v0.3.0 rows all have `superseded_by` pointing at their v0.4.0 equivalent; `ITAC-T-001` sits under `ITAC-C-001` at `library_version = "v0.4.0"`.
+
+**Command layer** (`app/src-tauri/src/commands/testing.rs`):
+- `MatcherRule::ItacBenfordFirstDigit` added; `for_test_code` routes `ITAC-T-001 → ItacBenfordFirstDigit`; dispatch branch calls `run_itac_benford_first_digit(...)`.
+- `run_itac_benford_first_digit` resolves the transaction-register import via `transaction_register` / `transactions` / `gl_export` / `primary` purpose-tag aliases (no supporting import — Benford is a single-population test), `load_csv_table`s it, calls the pure matcher, builds a three-variant summary based on whether exceptions contain `population_too_small` / are empty / carry digit anomalies, writes JSON detail with all counters + `chi_square` + `chi_square_critical` + `min_digit_rows` + `digit_deviation_threshold`, and constructs `RuleOutcome::base(..., "IT application controls", "itac-benford", ..., "Transaction register")`. Sets the four new ITAC counters on the outcome: `transactions_considered` (total rows in the register), `transactions_skipped_unparseable` (rows whose amount column didn't yield a number), `transactions_skipped_zero` (rows with amount = 0), `digit_rows_evaluated` (the subset that actually contributed to the digit distribution). `supporting_import` is `None`.
+- `RuleOutcome` grows four `Option<i64>` fields for the ITAC family. `MatcherRunResult` and `app/src/lib/api/tauri.ts`'s TypeScript mirror gain the same four, slotted into a new "IT application controls family" block in the type. Kept as separate fields from the UAR/CHG/BKP counters — each family carries different auditor-facing semantics and conflating them would lose meaning.
+- Three integration tests. `run_matcher_itac_benford_flags_uniform_digit_distribution`: 900 rows with amounts `[1, 2, 3, ..., 9, 1, 2, ...]` — a deliberately un-Benford distribution — asserts the test flips to `in_review`, `exception_count > 0`, at least one `digit_frequency_anomaly`, and the chi-square is present and exceeds the critical value. `run_matcher_itac_benford_passes_on_benford_like_population`: 900 rows drawn from powers of 1.12 (a classic Benford-compliant generator) — asserts no exceptions, `outcome == "passed"`, and chi-square is present and below the critical value. `run_matcher_itac_benford_flags_small_population`: 150 rows — asserts exactly one `population_too_small` exception, `chi_square: null` in the detail JSON, `digit_rows_evaluated < 300`.
+
+**Frontend** (`app/src/lib/api/tauri.ts`, `app/src/lib/routes/{EngagementDetail,WorkingPaper}.svelte`):
+- `MatcherRunResult` grows the four ITAC counters under a new "IT application controls family" comment block.
+- `EngagementDetail.svelte`: `PurposeTag` gains `"transaction_register"`; `PURPOSE_OPTIONS` gains "Transaction register — Export of the in-scope transaction population, with an amount column" so auditors can tag the file correctly at upload time. `MATCHER_ENABLED_CODES` gains `"ITAC-T-001"` so the Run button appears on that test row.
+- `WorkingPaper.svelte`: `MATCHER_ENABLED_CODES` gains `"ITAC-T-001"` so the Run button appears on the test's working-paper detail page.
+- No new Working Paper counter surfaces — the existing UI shows `rule`, `outcome`, and `exception_count`; the per-digit numbers live in the JSON detail blob and the downloadable report.
+
+**Verified**:
+- `cargo test --lib` — 117 passing (up from 104). New: ten matcher unit tests in `matcher::itac_benford::tests` and three integration tests in `commands::testing::tests` (happy, sad, too-small). `baseline_bundle_loads_into_fresh_db` updated to expect the v0.4.0 shape.
+- `npm run check` — 94 files, 0 errors, 0 warnings.
+- `npm run build` — clean vite bundle (~131.82 KB, gzip ~40.67 KB).
+
+**Design call — chi-square without a p-value function**: hardcoded the critical value (15.507 at 8 df, α = 0.05) rather than pulling in a statistics crate. The rule is deliberately conservative — if the observed distribution clears that bar, the test passes; if not, exceptions fire. A firm that wants a stricter α can add a separate rule later; the per-digit threshold (2 percentage points) gives more actionable information than a p-value anyway.
+
+**Design call — 300-row minimum**: below ~300 rows, chi-square loses power and any per-digit deviation is just noise. Chose to emit a single `population_too_small` exception rather than compute and display misleading digit frequencies. The auditor can see the threshold in the detail JSON and decide whether to re-export with a wider period.
+
+**Design call — supporting import = None for ITAC**: Benford is a one-sided test on a single population. Unlike UAR (AD + HR reconcile) or CHG (change register alone but bolts onto an approval log in the second rule), ITAC-T-001 needs exactly one file. The RuleOutcome still carries the `supporting_import` slot — future ITAC rules that want an expected-totals reconciliation can populate it.
+
+**Deliberately deferred**:
+- Second-digit Benford analysis (more sensitive for rounding fraud, noisier to interpret). First-digit is the default in the audit literature.
+- Excel/XLSX native parsing — today the transaction register must be CSV. A `xlsx` parser + `.xls` legacy reader come with the broader messy-HR-data ingester work.
+- Per-engagement threshold overrides — auditors currently can't dial the 2pp deviation threshold or the 300-row floor from the UI. These are firm-level defaults for now.
+- Override picker UI. Still `null`.
+
+**Files of note**: `app/src-tauri/src/matcher/itac_benford.rs` (new, ~450 lines), `app/src-tauri/src/matcher/mod.rs`, `app/src-tauri/resources/library/v0.4.0.json`, `app/src-tauri/resources/library/v0.4.0.json.sig`, `app/src-tauri/src/library/loader.rs`, `app/src-tauri/src/commands/testing.rs`, `app/src/lib/api/tauri.ts`, `app/src/lib/routes/EngagementDetail.svelte`, `app/src/lib/routes/WorkingPaper.svelte`.
+
+### 2026-04-24 — Orphan-accounts UAR matcher (UAM-T-004) shipped
+
+Third UAR rule lands: AD accounts that don't appear anywhere in the HR master list. The matcher inverts the terminated-but-active reconciliation — instead of asking "is a known leaver still enabled in AD?", it asks "is this enabled AD account on the authoritative employee roster?". An unmatched enabled account is an orphan: a service account someone never registered, a contractor whose engagement ended without HR closing the loop, a long-stale break-glass login. The HR master is the *current* employee list; terminated people belong on the leavers list consumed by `run_terminated_but_active`, not here.
+
+**Pure matcher** (`app/src-tauri/src/matcher/access_review.rs`):
+- `OrphanReport { rule, ad_rows_considered, ad_rows_skipped_disabled, ad_rows_skipped_unmatchable, hr_rows_considered, exceptions: Vec<OrphanException> }` and `OrphanException { kind: "orphan_account", email, logon, ad_ordinal, ad_row }`. `hr_rows_considered` is new to the UAR family — the size of the authoritative master so the auditor can sanity-check that the HR file covers who they expect.
+- `run_orphan_accounts(ad: &Table, hr_master: &Table) -> OrphanReport`. Builds a pair of `HashSet<String>` over HR emails and HR logons (normalised, empty strings discarded), then iterates AD rows: skip disabled into `ad_rows_skipped_disabled`, skip rows with neither email nor logon into `ad_rows_skipped_unmatchable`, flag rows whose email *and* logon are both absent from the master. Matching uses the same email-primary / logon-fallback logic as the terminated rule — a logon-only hit is enough to *clear* an account (errs toward fewer exceptions: a known employee with a renamed mailbox shouldn't be an orphan). `ad_rows_considered` is the full AD row count (parallel to the other two UAR reports), so disabled rows still show up in the total; the `*_skipped_*` counters are breakdowns the auditor reads off the summary card.
+- Six unit tests: exact-flag happy path, disabled-row-skipping, logon-only-fallback when HR lacks an email column, both-identifiers-missing skip path, empty-exceptions pass path, and case/whitespace-insensitive matching.
+
+**Library v0.3.0** (`app/src-tauri/resources/library/v0.3.0.json` + `.sig`):
+- Full carry-forward baseline: three risks, five controls, seven test procedures (six from v0.2.0 + new `UAM-T-004`), seven checklists, ten mappings. `superseded_by` fields left null on v0.3.0 rows; the loader's `mark_prior_versions_superseded` chains v0.2.0 → v0.3.0 automatically.
+- `UAM-T-004` sits under `UAM-C-002` alongside `UAM-T-002` (periodic recertification) and `UAM-T-003` (dormant accounts). Name "Review of orphan application accounts", six procedure steps (obtain AD + HR master, reconcile, investigate unmatched, classify, confirm disablement, document). `sampling_default: "none"`, `automation_hint: "rule-based"`, four-item evidence checklist (AD export with enabled flag, HR master roster, service-account register, disablement evidence / management justification for kept accounts).
+- Carry-forward chosen over a thin "UAM-T-004 only" bundle: (a) the loader's `control_code_to_id` is populated per-bundle only, so a test procedure referencing `UAM-C-002` forces re-emitting that control; (b) that control references `UAM-R-001` via `related_risk_codes`, forcing risks to carry too; (c) `current_library_version` uses `MAX(library_version) WHERE superseded_by IS NULL` on LibraryControl — a thin bundle would leave v0.2.0 controls un-superseded and break the query. Easier to make this the baseline pattern for every future library bundle.
+- Signed via the existing `tools/sign-library-bundle/` CLI against the private key at `~/.config/audit-app/signing/library.key`. Baked into `app/src-tauri/src/library/loader.rs` as `BUNDLE_V0_3_0` + `BUNDLE_V0_3_0_SIG` via `include_bytes!` / `include_str!`, installed as the third `install_bundle` call in `install_baseline_bundles`.
+
+**Command layer** (`app/src-tauri/src/commands/testing.rs`):
+- `MatcherRule::UarOrphanAccounts` added, `for_test_code` routes `UAM-T-004 → UarOrphanAccounts`, dispatch branch calls `run_uar_orphan_accounts(...)`.
+- `run_uar_orphan_accounts` mirrors the terminated-but-active shape: resolve AD import via `ad_export` / `entra_export` / `primary` purpose-tag aliases, resolve HR master via `hr_master` / `hr_roster` / `supporting` aliases, `load_csv_table` both, call the pure matcher, build summary ("N orphan accounts with no HR record" / "No orphan accounts across X AD rows and Y HR rows"), JSON detail with all counters, `RuleOutcome::base(..., "User access review", "access-review", ..., "AD export")` + `supporting_import = Some(hr_import)` + AD counters + new `hr_rows_considered`.
+- `RuleOutcome` gains `hr_rows_considered: Option<i64>`. `MatcherRunResult` and `app/src/lib/api/tauri.ts`'s TypeScript mirror gain the same field, slotted alongside `leaver_rows_considered` in the UAR counters block. Deliberately kept separate from `leaver_rows_considered` — the two supporting-import row counts carry different auditor-facing semantics ("active roster" vs "known terminations") and conflating them would lose that meaning.
+- Two integration tests cover the happy and pass paths — orphan-flagged with one exception (plus a disabled row to verify it's skipped from evaluation but still counted in `ad_rows_considered`) and every-AD-row-has-HR-match. The first asserts the detail JSON contains both `"orphan_accounts"` and `"hr_rows_considered"`, that `ActivityLog.matcher_run` fires once, that the Test flips to `in_review`, and that `supporting_import_filename` echoes back `"hr.csv"`. Both assert the new `rule: "orphan_accounts"` discriminator.
+
+**Frontend** (`app/src/lib/api/tauri.ts`, `app/src/lib/routes/{EngagementDetail,WorkingPaper}.svelte`):
+- `MatcherRunResult.hr_rows_considered: number | null` mirrors the Rust field.
+- `MATCHER_ENABLED_CODES` gets `"UAM-T-004"` in both routes. EngagementDetail's upload dropdown gains an `hr_master` `PurposeTag` + `PURPOSE_OPTIONS` entry ("HR master roster — Authoritative list of current employees (for orphan-account checks)") so auditors can tag the file when they upload it. The button still sends `overrides: null`; picker UI stays deferred.
+- No new Working Paper counters surfaced — the existing UI exposes `rule`, `outcome`, and `exception_count` as the human-visible summary; detailed counters live in the JSON detail blob and the downloadable report.
+
+**Verified**:
+- `cargo test --lib` — 104 passing (up from 96). New: six matcher unit tests in `matcher::access_review::tests` and two integration tests in `commands::testing::tests` (`run_matcher_orphan_accounts_flags_ad_rows_with_no_hr_match` + `run_matcher_orphan_accounts_passes_when_all_ad_rows_have_hr_match`). `clone_library_control_shares_risks_between_sibling_controls` updated to expect `test_count == 4` (UAM-C-002 now carries T-002 + T-003 + T-004 + an inherited test).
+- `npm run check` — 94 files, 0 errors, 0 warnings.
+- `npm run build` — clean vite bundle (~131 KB gzip 41 KB).
+
+**Gotcha worth preserving**: `OrphanReport.ad_rows_considered` counts *every* AD row, including disabled and unmatchable ones — the `ad_rows_skipped_*` buckets are breakdowns of that total, not exclusions from it. Same semantics as the other two UAR reports. The first version of `run_matcher_orphan_accounts_flags_ad_rows_with_no_hr_match` asserted `Some(3)` (only enabled rows) and had to be corrected to `Some(4)` — the same off-by-one trap flagged in the change-management gotcha last entry.
+
+**Deliberately deferred**:
+- Override picker UI. Still `null`.
+- Per-engagement HR-master staleness threshold (right now any HR master the user uploads is treated as current; no "this roster is older than N days" warning).
+- UAM-T-002 (periodic recertification) remains un-wired. Needs its own matcher module — current intent is to build it from a quarter-over-quarter diff of HR or AD snapshots rather than a single-file reconciliation. Not on the immediate path.
+
+**Files of note**: `app/src-tauri/src/matcher/access_review.rs`, `app/src-tauri/resources/library/v0.3.0.json`, `app/src-tauri/resources/library/v0.3.0.json.sig`, `app/src-tauri/src/library/loader.rs`, `app/src-tauri/src/commands/testing.rs`, `app/src/lib/api/tauri.ts`, `app/src/lib/routes/EngagementDetail.svelte`, `app/src/lib/routes/WorkingPaper.svelte`.
+
+### 2026-04-24 — Change-management + backup matchers wired, dispatcher generalised
+
+Two more rule matchers ship — `CHG-T-001` (approval-before-deployment) and `BKP-T-001` (backup performance) — and the access-review-shaped dispatcher becomes generic across every matcher family. The matcher modules themselves were already built and unit-tested; this change plumbs them into the command layer and the UI's run-matcher button.
+
+**Generic dispatcher** (`app/src-tauri/src/commands/testing.rs`):
+- `AccessReviewRule` → `MatcherRule` enum with four variants: `UarTerminatedButActive`, `UarDormantAccounts`, `ChgApprovalBeforeDeployment`, `BkpPerformance`. `for_test_code(&str)` still returns `AppError::Message` for any test code without a wired rule.
+- `RunAccessReviewInput { test_id, ad_import_id, leavers_import_id }` → `RunMatcherInput { test_id, overrides: Option<HashMap<String, String>> }`. The overrides map is keyed by `purpose_tag` and pins a specific `DataImport.id`; `null` falls back to the newest matching import per tag. `"primary"` / `"supporting"` work as alias keys so callers that don't know a rule's purpose tags can pin imports positionally.
+- `AccessReviewRunResult` → `MatcherRunResult`. Every family-specific counter is now `Option<i64>`. The `ad_import_*` / `leavers_import_*` fields generalise to `primary_import_*` / `supporting_import_*`. CHG counters (`changes_considered`, `changes_skipped_standard`, `changes_skipped_cancelled`, `changes_skipped_not_deployed`, `changes_skipped_no_id`, `changes_skipped_unparseable_dates`) and BKP counters (`jobs_considered`, `jobs_skipped_no_id`, `jobs_skipped_unknown_status`) sit alongside the existing UAR counters.
+- `engagement_run_access_review` Tauri command → `engagement_run_matcher`. Per-rule helpers (`run_uar_terminated_but_active`, `run_uar_dormant_accounts`, `run_chg_approval_before_deployment`, `run_bkp_performance`) own import resolution (purpose-tag lookup + blob read + CSV parse). The shared path after dispatch handles the Test + firm guard, blob write of the JSON report, and the `TestResult` / `SyncRecord` / `ChangeLog` / `ActivityLog` / `Evidence` persistence — unchanged in shape from the UAR version.
+- `RuleOutcome` carries downstream-relevant fields for every family: `family_label` ("User access review" / "Change management" / "Backup") lands in the ActivityLog line, `report_kind_slug` ("access-review" / "change-management" / "backup") in the blob filename, `primary_import_label` ("AD export" / "Change log" / "Backup log") in the `TestResult.population_ref_label`. A `RuleOutcome::base(...)` constructor defaults every family-specific counter to `None` so each per-rule helper only sets what its rule actually computes.
+
+**Per-rule purpose-tag conventions**:
+- UAR terminated-but-active (`UAM-T-001`): `ad_export` or `entra_export` (primary) + `hr_leavers` (supporting).
+- UAR dormant-accounts (`UAM-T-003`): `ad_export` or `entra_export` (primary); no supporting.
+- CHG approval-before-deployment (`CHG-T-001`): `change_log` or `change_register` (primary); no supporting.
+- BKP performance (`BKP-T-001`): `backup_log` or `backup_register` (primary); no supporting.
+
+**Wire-up** (`app/src-tauri/src/lib.rs`, `app/src-tauri/src/commands/{evidence,findings}.rs`):
+- Command registration updated. `evidence.rs` and `findings.rs` test imports follow the renamed types (`RunMatcherInput`, `run_matcher`); their four call sites now send `overrides: None`. The module-level doc comment in `evidence.rs` that described matcher-report provenance now names `run_matcher` instead of `run_access_review`.
+
+**Frontend** (`app/src/lib/api/tauri.ts`, `app/src/lib/routes/{EngagementDetail,WorkingPaper}.svelte`):
+- `RunMatcherInput` / `MatcherRunResult` TypeScript types mirror the new Rust shapes (all family counters `number | null`). `engagementRunMatcher` replaces `engagementRunAccessReview`.
+- `MATCHER_ENABLED_CODES` in both routes: `["UAM-T-001", "UAM-T-003", "CHG-T-001", "BKP-T-001"]`. The button still passes `overrides: null` — picker UI for pinning specific imports stays deferred until an auditor asks to re-run against an older file.
+- Upload dropdown's `PurposeTag` + `PURPOSE_OPTIONS` in EngagementDetail gain `change_log` and `backup_log` so auditors can tag those files when they arrive.
+
+**Verified**:
+- `cargo test --lib` — 96 passing (up from 73). New: four integration tests in `commands::testing::tests` covering CHG happy + sad paths and BKP happy + sad paths, plus the existing 15 unit tests in `matcher::change_management::tests` and 8 in `matcher::backup::tests` that landed when those matcher modules were first written.
+- `npm run check` — 94 files, 0 errors, 0 warnings.
+- `npm run build` — clean vite bundle.
+
+**Gotcha worth preserving**: `change_management::tests::changes_considered` counts *all rows in the change register*, not just the in-scope rows. In-scope = `changes_considered` minus each `changes_skipped_*` bucket. The integration test initially asserted in-scope semantics and had to be corrected after the fact — same shape of off-by-one likely waiting in the other families if future tests ever reason about "how many rows did the rule actually evaluate".
+
+**Deliberately deferred**:
+- Override picker UI. Backend accepts an arbitrary purpose-tag → import map; the UI still sends `null`. A per-rule picker slots in when auditors start wanting "run this test against last quarter's export instead of the latest".
+- Orphan-accounts UAR rule. Matcher isn't built yet; when it lands it adds one more variant to `MatcherRule` and one library test procedure, no dispatcher changes.
+- Per-engagement policy config. CHG + BKP currently use the hardcoded thresholds baked into their matcher modules (same posture as UAM-T-003's 90-day dormancy); a per-engagement override table arrives when a firm asks for a different window.
+
+**Files of note**: `app/src-tauri/src/commands/testing.rs`, `app/src-tauri/src/commands/evidence.rs`, `app/src-tauri/src/commands/findings.rs`, `app/src-tauri/src/lib.rs`, `app/src/lib/api/tauri.ts`, `app/src/lib/routes/EngagementDetail.svelte`, `app/src/lib/routes/WorkingPaper.svelte`.
 
 ### 2026-04-24 — Working Paper view + CCCER finding editor
 

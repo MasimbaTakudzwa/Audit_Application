@@ -150,28 +150,60 @@ export interface TestSummary {
   latest_result_evidence_count: number | null;
 }
 
-export interface RunAccessReviewInput {
+export interface RunMatcherInput {
   test_id: string;
-  ad_import_id: string | null;
-  leavers_import_id: string | null;
+  /**
+   * Map of purpose_tag to DataImport.id, pinning a specific import for one
+   * or more of the rule's inputs. Normally `null`: the backend picks the
+   * newest matching import per purpose tag.
+   */
+  overrides: Record<string, string> | null;
 }
 
-export interface AccessReviewRunResult {
+export interface MatcherRunResult {
   test_result_id: string;
   rule: string;
   outcome: string;
   exception_count: number;
-  ad_import_id: string;
-  ad_import_filename: string | null;
-  ad_rows_considered: number;
-  ad_rows_skipped_disabled: number;
-  leavers_import_id: string | null;
-  leavers_import_filename: string | null;
+  primary_import_id: string;
+  primary_import_filename: string | null;
+  supporting_import_id: string | null;
+  supporting_import_filename: string | null;
+  // User access review family
+  ad_rows_considered: number | null;
+  ad_rows_skipped_disabled: number | null;
   leaver_rows_considered: number | null;
+  hr_rows_considered: number | null;
   ad_rows_skipped_unmatchable: number | null;
   ad_rows_skipped_no_last_logon: number | null;
   ad_rows_skipped_unparseable: number | null;
   dormancy_threshold_days: number | null;
+  // Change management family
+  changes_considered: number | null;
+  changes_skipped_standard: number | null;
+  changes_skipped_cancelled: number | null;
+  changes_skipped_not_deployed: number | null;
+  changes_skipped_no_id: number | null;
+  changes_skipped_unparseable_dates: number | null;
+  // CHG SoD (dev-vs-deploy) — two permission-list inputs, not a change log
+  deploy_rows_considered: number | null;
+  deploy_rows_skipped_unmatchable: number | null;
+  source_rows_considered: number | null;
+  source_rows_skipped_unmatchable: number | null;
+  intersecting_users: number | null;
+  // Backup family
+  jobs_considered: number | null;
+  jobs_skipped_no_id: number | null;
+  jobs_skipped_unknown_status: number | null;
+  // IT application controls family
+  transactions_considered: number | null;
+  transactions_skipped_unparseable: number | null;
+  transactions_skipped_zero: number | null;
+  digit_rows_evaluated: number | null;
+  // Duplicate-transaction detection (ITAC-T-002)
+  transactions_skipped_no_key: number | null;
+  duplicate_group_count: number | null;
+  total_duplicate_rows: number | null;
 }
 
 export interface TestResultSummary {
@@ -379,8 +411,8 @@ export const api = {
     }),
   engagementListTests: (engagementId: string) =>
     invoke<TestSummary[]>("engagement_list_tests", { engagementId }),
-  engagementRunAccessReview: (input: RunAccessReviewInput) =>
-    invoke<AccessReviewRunResult>("engagement_run_access_review", { input }),
+  engagementRunMatcher: (input: RunMatcherInput) =>
+    invoke<MatcherRunResult>("engagement_run_matcher", { input }),
   engagementListTestResults: (engagementId: string) =>
     invoke<TestResultSummary[]>("engagement_list_test_results", {
       engagementId,
