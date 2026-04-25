@@ -39,7 +39,7 @@ use crate::{
     error::{AppError, AppResult},
     matcher::{
         access_review, backup, change_management, csv as csv_parser, itac_benford,
-        itac_duplicates,
+        itac_boundary, itac_duplicates, itac_recurring,
     },
     paths::AppPaths,
 };
@@ -145,6 +145,19 @@ pub struct MatcherRunResult {
     pub ad_rows_skipped_no_last_logon: Option<i64>,
     pub ad_rows_skipped_unparseable: Option<i64>,
     pub dormancy_threshold_days: Option<i64>,
+    // Periodic recertification (UAM-T-002) — `review_rows_considered` counts
+    // every row in the access-review log (including unmatchable ones, same
+    // convention as `ad_rows_considered`). `unreviewed_count` +
+    // `unremediated_count` sum to the rule's exception_count.
+    // `remediation_check_applied` reflects whether the log carried the
+    // columns needed for the second leg of the rule; when false,
+    // `unremediated_count` is always zero.
+    pub review_rows_considered: Option<i64>,
+    pub review_rows_skipped_unmatchable: Option<i64>,
+    pub unreviewed_count: Option<i64>,
+    pub unremediated_count: Option<i64>,
+    pub remediation_check_applied: Option<bool>,
+    pub remediation_window_days: Option<i64>,
     // --- Change management family ---
     pub changes_considered: Option<i64>,
     pub changes_skipped_standard: Option<i64>,
@@ -173,6 +186,27 @@ pub struct MatcherRunResult {
     pub transactions_skipped_no_key: Option<i64>,
     pub duplicate_group_count: Option<i64>,
     pub total_duplicate_rows: Option<i64>,
+    // Boundary / threshold analysis (ITAC-T-003) adds two counters.
+    // `thresholds_evaluated` is the number of thresholds whose below-or-above
+    // window caught at least one row; `thresholds_flagged` is the subset of
+    // those that met both the absolute and ratio gates.
+    pub thresholds_evaluated: Option<i64>,
+    pub thresholds_flagged: Option<i64>,
+    // Recurring-amount detection (ITAC-T-004) adds five counters.
+    // `transactions_skipped_no_counterparty` is rows with a parseable non-zero
+    // amount but no counterparty cell — can't contribute to the diversity
+    // count. `transactions_skipped_below_significance` is rows whose absolute
+    // amount is under the significance floor and so are not grouped at all.
+    // `recurring_group_count` is how many amount groups passed all three
+    // gates (rows >= MIN_GROUP_ROWS, distinct counterparties >= MIN_DISTINCT_
+    // COUNTERPARTIES, amount >= MIN_AMOUNT_CENTS); `total_recurring_rows`
+    // sums row counts across those groups; `recurring_min_amount_cents` is
+    // the significance floor applied to this run, exposed for auditor review.
+    pub transactions_skipped_no_counterparty: Option<i64>,
+    pub transactions_skipped_below_significance: Option<i64>,
+    pub recurring_group_count: Option<i64>,
+    pub total_recurring_rows: Option<i64>,
+    pub recurring_min_amount_cents: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1112,6 +1146,14 @@ pub(crate) fn run_matcher(
             MatcherRule::UarOrphanAccounts => {
                 run_uar_orphan_accounts(&tx, paths, &engagement_id, &master_key, &overrides)?
             }
+            MatcherRule::UarPeriodicRecertification => run_uar_periodic_recertification(
+                &tx,
+                paths,
+                &engagement_id,
+                &master_key,
+                &overrides,
+                now,
+            )?,
             MatcherRule::ChgApprovalBeforeDeployment => run_chg_approval_before_deployment(
                 &tx,
                 paths,
@@ -1129,6 +1171,20 @@ pub(crate) fn run_matcher(
                 run_itac_benford_first_digit(&tx, paths, &engagement_id, &master_key, &overrides)?
             }
             MatcherRule::ItacDuplicateTransactions => run_itac_duplicate_transactions(
+                &tx,
+                paths,
+                &engagement_id,
+                &master_key,
+                &overrides,
+            )?,
+            MatcherRule::ItacBoundaryThreshold => run_itac_boundary_thresholds(
+                &tx,
+                paths,
+                &engagement_id,
+                &master_key,
+                &overrides,
+            )?,
+            MatcherRule::ItacRecurringAmounts => run_itac_recurring_amounts(
                 &tx,
                 paths,
                 &engagement_id,
@@ -1373,6 +1429,12 @@ pub(crate) fn run_matcher(
             ad_rows_skipped_no_last_logon: outcome.ad_rows_skipped_no_last_logon,
             ad_rows_skipped_unparseable: outcome.ad_rows_skipped_unparseable,
             dormancy_threshold_days: outcome.dormancy_threshold_days,
+            review_rows_considered: outcome.review_rows_considered,
+            review_rows_skipped_unmatchable: outcome.review_rows_skipped_unmatchable,
+            unreviewed_count: outcome.unreviewed_count,
+            unremediated_count: outcome.unremediated_count,
+            remediation_check_applied: outcome.remediation_check_applied,
+            remediation_window_days: outcome.remediation_window_days,
             changes_considered: outcome.changes_considered,
             changes_skipped_standard: outcome.changes_skipped_standard,
             changes_skipped_cancelled: outcome.changes_skipped_cancelled,
@@ -1394,6 +1456,14 @@ pub(crate) fn run_matcher(
             transactions_skipped_no_key: outcome.transactions_skipped_no_key,
             duplicate_group_count: outcome.duplicate_group_count,
             total_duplicate_rows: outcome.total_duplicate_rows,
+            thresholds_evaluated: outcome.thresholds_evaluated,
+            thresholds_flagged: outcome.thresholds_flagged,
+            transactions_skipped_no_counterparty: outcome.transactions_skipped_no_counterparty,
+            transactions_skipped_below_significance: outcome
+                .transactions_skipped_below_significance,
+            recurring_group_count: outcome.recurring_group_count,
+            total_recurring_rows: outcome.total_recurring_rows,
+            recurring_min_amount_cents: outcome.recurring_min_amount_cents,
         })
     })
 }
@@ -1406,17 +1476,21 @@ enum MatcherRule {
     UarTerminatedButActive,
     UarDormantAccounts,
     UarOrphanAccounts,
+    UarPeriodicRecertification,
     ChgApprovalBeforeDeployment,
     ChgSodDevVsDeploy,
     BkpPerformance,
     ItacBenfordFirstDigit,
     ItacDuplicateTransactions,
+    ItacBoundaryThreshold,
+    ItacRecurringAmounts,
 }
 
 impl MatcherRule {
     fn for_test_code(code: &str) -> AppResult<Self> {
         match code {
             "UAM-T-001" => Ok(Self::UarTerminatedButActive),
+            "UAM-T-002" => Ok(Self::UarPeriodicRecertification),
             "UAM-T-003" => Ok(Self::UarDormantAccounts),
             "UAM-T-004" => Ok(Self::UarOrphanAccounts),
             "CHG-T-001" => Ok(Self::ChgApprovalBeforeDeployment),
@@ -1424,6 +1498,8 @@ impl MatcherRule {
             "BKP-T-001" => Ok(Self::BkpPerformance),
             "ITAC-T-001" => Ok(Self::ItacBenfordFirstDigit),
             "ITAC-T-002" => Ok(Self::ItacDuplicateTransactions),
+            "ITAC-T-003" => Ok(Self::ItacBoundaryThreshold),
+            "ITAC-T-004" => Ok(Self::ItacRecurringAmounts),
             other => Err(AppError::Message(format!(
                 "no matcher is wired for test code {other}"
             ))),
@@ -1467,6 +1543,15 @@ struct RuleOutcome {
     /// membership check. Separate from `leaver_rows_considered` because it
     /// carries different semantics (active employees vs known terminations).
     hr_rows_considered: Option<i64>,
+    // Periodic recertification (UAM-T-002) counters. The review log is a
+    // supporting input — AD remains primary for this rule so all UAR rules
+    // share a consistent `population_ref_label` (the AD export).
+    review_rows_considered: Option<i64>,
+    review_rows_skipped_unmatchable: Option<i64>,
+    unreviewed_count: Option<i64>,
+    unremediated_count: Option<i64>,
+    remediation_check_applied: Option<bool>,
+    remediation_window_days: Option<i64>,
     // --- CHG counters ---
     changes_considered: Option<i64>,
     changes_skipped_standard: Option<i64>,
@@ -1510,6 +1595,33 @@ struct RuleOutcome {
     /// Duplicate-transaction rule: total rows across all flagged groups.
     /// Always `>= duplicate_group_count * 2`.
     total_duplicate_rows: Option<i64>,
+    /// Boundary / threshold rule: thresholds whose below-or-above window
+    /// caught at least one row. Thresholds strictly above the population's
+    /// max amount are silently dropped and do not count.
+    thresholds_evaluated: Option<i64>,
+    /// Boundary / threshold rule: thresholds that tripped both the absolute
+    /// and ratio gates. Equal to `exception_count` for this rule.
+    thresholds_flagged: Option<i64>,
+    /// Recurring-amount rule: rows with a parseable non-zero amount but no
+    /// counterparty cell. They cannot contribute to the diversity-of-
+    /// counterparty signal, so they are skipped rather than grouped.
+    transactions_skipped_no_counterparty: Option<i64>,
+    /// Recurring-amount rule: rows whose absolute amount is below the
+    /// significance floor (`MIN_AMOUNT_CENTS`). Skipped at row time so they
+    /// can never form a flagged group.
+    transactions_skipped_below_significance: Option<i64>,
+    /// Recurring-amount rule: number of amount groups that passed all three
+    /// gates (rows >= `MIN_GROUP_ROWS`, distinct counterparties >=
+    /// `MIN_DISTINCT_COUNTERPARTIES`, amount >= `MIN_AMOUNT_CENTS`). Equal
+    /// to `exception_count` for this rule.
+    recurring_group_count: Option<i64>,
+    /// Recurring-amount rule: sum of `row_count` across all flagged groups.
+    /// Auditor reads this for total exposed population in one figure.
+    total_recurring_rows: Option<i64>,
+    /// Recurring-amount rule: significance floor applied to this run, in
+    /// integer cents. Exposed so the auditor can read the tuning constant
+    /// alongside the result without opening source.
+    recurring_min_amount_cents: Option<i64>,
 }
 
 impl RuleOutcome {
@@ -1545,6 +1657,12 @@ impl RuleOutcome {
             ad_rows_skipped_unparseable: None,
             dormancy_threshold_days: None,
             hr_rows_considered: None,
+            review_rows_considered: None,
+            review_rows_skipped_unmatchable: None,
+            unreviewed_count: None,
+            unremediated_count: None,
+            remediation_check_applied: None,
+            remediation_window_days: None,
             changes_considered: None,
             changes_skipped_standard: None,
             changes_skipped_cancelled: None,
@@ -1566,6 +1684,13 @@ impl RuleOutcome {
             transactions_skipped_no_key: None,
             duplicate_group_count: None,
             total_duplicate_rows: None,
+            thresholds_evaluated: None,
+            thresholds_flagged: None,
+            transactions_skipped_no_counterparty: None,
+            transactions_skipped_below_significance: None,
+            recurring_group_count: None,
+            total_recurring_rows: None,
+            recurring_min_amount_cents: None,
         }
     }
 }
@@ -1828,6 +1953,135 @@ fn run_uar_orphan_accounts(
     outcome.ad_rows_skipped_disabled = Some(report.ad_rows_skipped_disabled as i64);
     outcome.ad_rows_skipped_unmatchable = Some(report.ad_rows_skipped_unmatchable as i64);
     outcome.hr_rows_considered = Some(report.hr_rows_considered as i64);
+    Ok(outcome)
+}
+
+/// UAR periodic recertification: AD export + access-review log → exceptions
+/// for enabled AD rows that were not covered by the review (completeness)
+/// and for review rows where an exception was raised and remediation is
+/// still open past the configured window (remediation).
+///
+/// AD remains primary so the family presents a consistent
+/// `population_ref_label` across all four UAR rules. The access-review log is
+/// the supporting import.
+fn run_uar_periodic_recertification(
+    tx: &rusqlite::Transaction<'_>,
+    paths: &AppPaths,
+    engagement_id: &str,
+    master_key: &[u8; 32],
+    overrides: &HashMap<String, String>,
+    now: i64,
+) -> AppResult<RuleOutcome> {
+    let ad_override = overrides
+        .get("ad_export")
+        .or_else(|| overrides.get("entra_export"))
+        .or_else(|| overrides.get("primary"))
+        .map(String::as_str);
+    let ad_import = resolve_import(
+        tx,
+        engagement_id,
+        ad_override,
+        &["ad_export", "entra_export"],
+        "AD or Entra export",
+    )?;
+    let ad_table = load_csv_table(tx, paths, master_key, &ad_import, "AD export")?;
+
+    let review_override = overrides
+        .get("access_review")
+        .or_else(|| overrides.get("access_review_log"))
+        .or_else(|| overrides.get("recertification_log"))
+        .or_else(|| overrides.get("supporting"))
+        .map(String::as_str);
+    let review_import = resolve_import(
+        tx,
+        engagement_id,
+        review_override,
+        &["access_review", "access_review_log", "recertification_log"],
+        "access-review log",
+    )?;
+    let review_table =
+        load_csv_table(tx, paths, master_key, &review_import, "access-review log")?;
+
+    let window_days = access_review::REMEDIATION_WINDOW_DAYS_DEFAULT;
+    let report = access_review::run_periodic_recertification(
+        &review_table,
+        &ad_table,
+        now,
+        window_days,
+    );
+    let exception_count = (report.unreviewed_count + report.unremediated_count) as i64;
+    let remediation_applied = report.remediation_check_applied;
+
+    let summary = match (exception_count, remediation_applied) {
+        (0, true) => format!(
+            "No recertification gaps across {} AD row{} and {} review row{} ({}-day window)",
+            report.ad_rows_considered,
+            if report.ad_rows_considered == 1 { "" } else { "s" },
+            report.review_rows_considered,
+            if report.review_rows_considered == 1 { "" } else { "s" },
+            report.remediation_window_days,
+        ),
+        (0, false) => format!(
+            "No unreviewed accounts across {} AD row{} (remediation check skipped — review log has no exception/remediation columns)",
+            report.ad_rows_considered,
+            if report.ad_rows_considered == 1 { "" } else { "s" }
+        ),
+        (n, true) => format!(
+            "{} recertification gap{}: {} unreviewed account{}, {} unremediated exception{} ({}-day window)",
+            n,
+            if n == 1 { "" } else { "s" },
+            report.unreviewed_count,
+            if report.unreviewed_count == 1 { "" } else { "s" },
+            report.unremediated_count,
+            if report.unremediated_count == 1 { "" } else { "s" },
+            report.remediation_window_days,
+        ),
+        (n, false) => format!(
+            "{} unreviewed account{} (remediation check skipped — review log has no exception/remediation columns)",
+            n,
+            if n == 1 { "" } else { "s" }
+        ),
+    };
+    let detail = json!({
+        "rule": report.rule,
+        "ad_import_id": ad_import.id,
+        "access_review_import_id": review_import.id,
+        "ad_rows_considered": report.ad_rows_considered,
+        "ad_rows_skipped_disabled": report.ad_rows_skipped_disabled,
+        "ad_rows_skipped_unmatchable": report.ad_rows_skipped_unmatchable,
+        "review_rows_considered": report.review_rows_considered,
+        "review_rows_skipped_unmatchable": report.review_rows_skipped_unmatchable,
+        "unreviewed_count": report.unreviewed_count,
+        "unremediated_count": report.unremediated_count,
+        "remediation_check_applied": report.remediation_check_applied,
+        "remediation_window_days": report.remediation_window_days,
+        "as_of_secs": report.as_of_secs,
+    })
+    .to_string();
+    let report_json = serde_json::to_vec_pretty(&report)?;
+
+    let mut outcome = RuleOutcome::base(
+        report.rule.clone(),
+        "User access review",
+        "access-review",
+        report_json,
+        exception_count,
+        summary,
+        detail,
+        ad_import,
+        "AD export",
+    );
+    outcome.supporting_import = Some(review_import);
+    outcome.ad_rows_considered = Some(report.ad_rows_considered as i64);
+    outcome.ad_rows_skipped_disabled = Some(report.ad_rows_skipped_disabled as i64);
+    outcome.ad_rows_skipped_unmatchable = Some(report.ad_rows_skipped_unmatchable as i64);
+    outcome.review_rows_considered = Some(report.review_rows_considered as i64);
+    outcome.review_rows_skipped_unmatchable =
+        Some(report.review_rows_skipped_unmatchable as i64);
+    outcome.unreviewed_count = Some(report.unreviewed_count as i64);
+    outcome.unremediated_count = Some(report.unremediated_count as i64);
+    outcome.remediation_check_applied = Some(report.remediation_check_applied);
+    outcome.remediation_window_days = Some(report.remediation_window_days as i64);
     Ok(outcome)
 }
 
@@ -2247,6 +2501,182 @@ fn run_itac_duplicate_transactions(
     outcome.transactions_skipped_no_key = Some(report.rows_skipped_no_key as i64);
     outcome.duplicate_group_count = Some(report.duplicate_group_count as i64);
     outcome.total_duplicate_rows = Some(report.total_duplicate_rows as i64);
+    Ok(outcome)
+}
+
+/// ITAC boundary / threshold analysis: evaluate a fixed list of approval
+/// thresholds against the transaction population and flag any whose
+/// just-below window holds materially more rows than the just-above
+/// window. Reuses the Benford / duplicates rules' `transaction_register`
+/// purpose tag — all three consume the same export.
+fn run_itac_boundary_thresholds(
+    tx: &rusqlite::Transaction<'_>,
+    paths: &AppPaths,
+    engagement_id: &str,
+    master_key: &[u8; 32],
+    overrides: &HashMap<String, String>,
+) -> AppResult<RuleOutcome> {
+    let txn_override = overrides
+        .get("transaction_register")
+        .or_else(|| overrides.get("transactions"))
+        .or_else(|| overrides.get("gl_export"))
+        .or_else(|| overrides.get("primary"))
+        .map(String::as_str);
+    let txn_import = resolve_import(
+        tx,
+        engagement_id,
+        txn_override,
+        &["transaction_register", "transactions", "gl_export"],
+        "transaction register",
+    )?;
+    let txn_table = load_csv_table(tx, paths, master_key, &txn_import, "transaction register")?;
+
+    let report = itac_boundary::run_boundary_thresholds(&txn_table);
+    let exception_count = report.exceptions.len() as i64;
+    let summary = if exception_count == 0 {
+        format!(
+            "No boundary thresholds flagged across {} considered row{} ({} threshold{} evaluated)",
+            report.rows_considered,
+            if report.rows_considered == 1 { "" } else { "s" },
+            report.thresholds_evaluated,
+            if report.thresholds_evaluated == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "{} threshold{} flagged across {} considered row{} ({} threshold{} evaluated)",
+            report.thresholds_flagged,
+            if report.thresholds_flagged == 1 { "" } else { "s" },
+            report.rows_considered,
+            if report.rows_considered == 1 { "" } else { "s" },
+            report.thresholds_evaluated,
+            if report.thresholds_evaluated == 1 { "" } else { "s" }
+        )
+    };
+    let detail = json!({
+        "rule": report.rule,
+        "transaction_register_import_id": txn_import.id,
+        "rows_considered": report.rows_considered,
+        "rows_skipped_unparseable": report.rows_skipped_unparseable,
+        "rows_skipped_zero": report.rows_skipped_zero,
+        "thresholds_evaluated": report.thresholds_evaluated,
+        "thresholds_flagged": report.thresholds_flagged,
+        "window_fraction": report.window_fraction,
+        "min_below_count": report.min_below_count,
+        "flag_ratio": report.flag_ratio,
+    })
+    .to_string();
+    let report_json = serde_json::to_vec_pretty(&report)?;
+
+    let mut outcome = RuleOutcome::base(
+        report.rule.clone(),
+        "IT application controls",
+        "itac-boundary",
+        report_json,
+        exception_count,
+        summary,
+        detail,
+        txn_import,
+        "Transaction register",
+    );
+    outcome.transactions_considered = Some(report.rows_considered as i64);
+    outcome.transactions_skipped_unparseable = Some(report.rows_skipped_unparseable as i64);
+    outcome.transactions_skipped_zero = Some(report.rows_skipped_zero as i64);
+    outcome.thresholds_evaluated = Some(report.thresholds_evaluated as i64);
+    outcome.thresholds_flagged = Some(report.thresholds_flagged as i64);
+    Ok(outcome)
+}
+
+/// ITAC recurring-amount detection: flag amounts that recur across many
+/// distinct counterparties. Reuses the Benford / duplicates / boundary
+/// rules' `transaction_register` purpose tag — all four ITAC rules consume
+/// the same single-input population. Single-input rule: no supporting
+/// import. The diversity-of-counterparty signal is computed off the
+/// counterparty column already present in the transaction register itself.
+fn run_itac_recurring_amounts(
+    tx: &rusqlite::Transaction<'_>,
+    paths: &AppPaths,
+    engagement_id: &str,
+    master_key: &[u8; 32],
+    overrides: &HashMap<String, String>,
+) -> AppResult<RuleOutcome> {
+    let txn_override = overrides
+        .get("transaction_register")
+        .or_else(|| overrides.get("transactions"))
+        .or_else(|| overrides.get("gl_export"))
+        .or_else(|| overrides.get("primary"))
+        .map(String::as_str);
+    let txn_import = resolve_import(
+        tx,
+        engagement_id,
+        txn_override,
+        &["transaction_register", "transactions", "gl_export"],
+        "transaction register",
+    )?;
+    let txn_table = load_csv_table(tx, paths, master_key, &txn_import, "transaction register")?;
+
+    let report = itac_recurring::run_recurring_amounts(&txn_table);
+    let exception_count = report.exceptions.len() as i64;
+    let summary = if exception_count == 0 {
+        format!(
+            "No recurring-amount clusters across {} considered row{} (gates: >= {} rows AND >= {} distinct counterparties AND >= {} cents)",
+            report.rows_considered,
+            if report.rows_considered == 1 { "" } else { "s" },
+            report.min_group_rows,
+            report.min_distinct_counterparties,
+            report.min_amount_cents,
+        )
+    } else {
+        format!(
+            "{} recurring-amount cluster{} covering {} row{} across {} considered row{} (gates: >= {} rows AND >= {} distinct counterparties AND >= {} cents)",
+            report.recurring_group_count,
+            if report.recurring_group_count == 1 { "" } else { "s" },
+            report.total_recurring_rows,
+            if report.total_recurring_rows == 1 { "" } else { "s" },
+            report.rows_considered,
+            if report.rows_considered == 1 { "" } else { "s" },
+            report.min_group_rows,
+            report.min_distinct_counterparties,
+            report.min_amount_cents,
+        )
+    };
+    let detail = json!({
+        "rule": report.rule,
+        "transaction_register_import_id": txn_import.id,
+        "rows_considered": report.rows_considered,
+        "rows_skipped_unparseable": report.rows_skipped_unparseable,
+        "rows_skipped_zero": report.rows_skipped_zero,
+        "rows_skipped_no_counterparty": report.rows_skipped_no_counterparty,
+        "rows_skipped_below_significance": report.rows_skipped_below_significance,
+        "min_group_rows": report.min_group_rows,
+        "min_distinct_counterparties": report.min_distinct_counterparties,
+        "min_amount_cents": report.min_amount_cents,
+        "recurring_group_count": report.recurring_group_count,
+        "total_recurring_rows": report.total_recurring_rows,
+    })
+    .to_string();
+    let report_json = serde_json::to_vec_pretty(&report)?;
+
+    let mut outcome = RuleOutcome::base(
+        report.rule.clone(),
+        "IT application controls",
+        "itac-recurring",
+        report_json,
+        exception_count,
+        summary,
+        detail,
+        txn_import,
+        "Transaction register",
+    );
+    outcome.transactions_considered = Some(report.rows_considered as i64);
+    outcome.transactions_skipped_unparseable = Some(report.rows_skipped_unparseable as i64);
+    outcome.transactions_skipped_zero = Some(report.rows_skipped_zero as i64);
+    outcome.transactions_skipped_no_counterparty =
+        Some(report.rows_skipped_no_counterparty as i64);
+    outcome.transactions_skipped_below_significance =
+        Some(report.rows_skipped_below_significance as i64);
+    outcome.recurring_group_count = Some(report.recurring_group_count as i64);
+    outcome.total_recurring_rows = Some(report.total_recurring_rows as i64);
+    outcome.recurring_min_amount_cents = Some(report.min_amount_cents);
     Ok(outcome)
 }
 
@@ -3384,11 +3814,12 @@ mod tests {
 
     #[test]
     fn run_matcher_rejects_test_code_that_has_no_rule() {
-        // UAM-T-002 (the periodic-recertification test) has no matcher wired
-        // up; the command must reject it cleanly rather than silently falling
-        // through to a default rule. UAM-T-002 sits under UAM-C-002 alongside
-        // UAM-T-003 (dormant accounts), so cloning the parent control gives
-        // us both tests.
+        // Every library test procedure currently ships with a wired matcher
+        // (UAM-T-001..004, CHG-T-001..002, BKP-T-001, ITAC-T-001..003), so we
+        // simulate an unwired code by cloning a real control and mutating one
+        // of the resulting Test rows' `code` to something the dispatcher
+        // doesn't recognise. This keeps the guard-rail covered when a future
+        // library bundle adds a new test procedure ahead of its matcher.
         let (db, db_path) = seeded_db("firm-dm2", "user-dm2", "client-dm2", "eng-dm2");
         let auth = session_for("firm-dm2", "user-dm2");
         let blob_dir = tempfile::tempdir().unwrap();
@@ -3406,12 +3837,17 @@ mod tests {
         .unwrap();
 
         let unwired_test_id: String = db
-            .with(|conn| {
-                Ok(conn.query_row(
+            .with_mut(|conn| {
+                let id: String = conn.query_row(
                     "SELECT id FROM Test WHERE engagement_id = 'eng-dm2' AND code = 'UAM-T-002'",
                     [],
                     |r| r.get(0),
-                )?)
+                )?;
+                conn.execute(
+                    "UPDATE Test SET code = 'XYZ-T-999' WHERE id = ?1",
+                    params![id],
+                )?;
+                Ok(id)
             })
             .unwrap();
 
@@ -3971,6 +4407,317 @@ mod tests {
         assert_eq!(result.exception_count, 0);
         assert_eq!(result.ad_rows_considered, Some(2));
         assert_eq!(result.hr_rows_considered, Some(3));
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn run_matcher_recertification_flags_unreviewed_and_unremediated() {
+        // UAM-C-002 ships UAM-T-002 as the periodic-recertification procedure.
+        // Seed: 3 enabled AD rows (alice, bob, carol) + 1 disabled (dan).
+        // Review log covers alice (approved+closed) and bob (exception+open,
+        // reviewed 2020-01-01 → comfortably stale). carol is not in the log,
+        // so she's unreviewed. Disabled dan is skipped from the completeness
+        // check. Expect exception_count = 2 (1 unreviewed + 1 unremediated).
+        let (db, db_path) = seeded_db("firm-rc1", "user-rc1", "client-rc1", "eng-rc1");
+        let auth = session_for("firm-rc1", "user-rc1");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-rc1".into(),
+                library_control_id: library_control_id(&db, "UAM-C-002"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+        let recert_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-rc1' AND code = 'UAM-T-002'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-rc1".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "ad_export".into(),
+                filename: "ad.csv".into(),
+                mime_type: Some("text/csv".into()),
+                content: b"sAMAccountName,email,enabled\n\
+                           alice,alice@acme.com,TRUE\n\
+                           bob,bob@acme.com,TRUE\n\
+                           carol,carol@acme.com,TRUE\n\
+                           dan,dan@acme.com,FALSE\n"
+                    .to_vec(),
+            },
+        )
+        .unwrap();
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-rc1".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "access_review".into(),
+                filename: "access_review.csv".into(),
+                mime_type: Some("text/csv".into()),
+                content: b"email,review_date,decision,remediation_status\n\
+                           alice@acme.com,2020-01-01,approved,closed\n\
+                           bob@acme.com,2020-01-01,exception,open\n"
+                    .to_vec(),
+            },
+        )
+        .unwrap();
+
+        let result = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: recert_test_id.clone(),
+                overrides: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.rule, "periodic_recertification");
+        assert_eq!(result.outcome, "exception");
+        assert_eq!(result.exception_count, 2);
+        assert_eq!(result.ad_rows_considered, Some(4));
+        assert_eq!(result.ad_rows_skipped_disabled, Some(1));
+        assert_eq!(result.review_rows_considered, Some(2));
+        assert_eq!(result.unreviewed_count, Some(1));
+        assert_eq!(result.unremediated_count, Some(1));
+        assert_eq!(result.remediation_check_applied, Some(true));
+        assert_eq!(result.remediation_window_days, Some(90));
+        assert!(result.supporting_import_id.is_some());
+        assert!(result
+            .supporting_import_filename
+            .as_deref()
+            .map(|n| n == "access_review.csv")
+            .unwrap_or(false));
+
+        db.with(|conn| {
+            let (outcome, detail): (String, String) = conn.query_row(
+                "SELECT outcome, detail_json FROM TestResult WHERE id = ?1",
+                params![result.test_result_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert_eq!(outcome, "exception");
+            assert!(detail.contains("periodic_recertification"));
+            assert!(detail.contains("unreviewed_count"));
+            assert!(detail.contains("unremediated_count"));
+            assert!(detail.contains("remediation_check_applied"));
+
+            let test_status: String = conn.query_row(
+                "SELECT status FROM Test WHERE id = ?1",
+                params![recert_test_id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(test_status, "in_review");
+
+            let activity: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ActivityLog
+                 WHERE engagement_id = 'eng-rc1' AND action = 'matcher_run'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(activity, 1);
+            Ok(())
+        })
+        .unwrap();
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn run_matcher_recertification_passes_when_all_users_reviewed_and_clean() {
+        // Every enabled AD user is in the review log with approved+closed.
+        // No unreviewed, no unremediated → pass.
+        let (db, db_path) = seeded_db("firm-rc2", "user-rc2", "client-rc2", "eng-rc2");
+        let auth = session_for("firm-rc2", "user-rc2");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-rc2".into(),
+                library_control_id: library_control_id(&db, "UAM-C-002"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+        let recert_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-rc2' AND code = 'UAM-T-002'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-rc2".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "ad_export".into(),
+                filename: "ad.csv".into(),
+                mime_type: None,
+                content: b"email,enabled\nalice@a.com,TRUE\nbob@a.com,TRUE\n".to_vec(),
+            },
+        )
+        .unwrap();
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-rc2".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "access_review".into(),
+                filename: "access_review.csv".into(),
+                mime_type: None,
+                content: b"email,review_date,decision,remediation_status\n\
+                           alice@a.com,2025-02-01,approved,closed\n\
+                           bob@a.com,2025-02-01,approved,closed\n"
+                    .to_vec(),
+            },
+        )
+        .unwrap();
+
+        let result = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: recert_test_id,
+                overrides: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.rule, "periodic_recertification");
+        assert_eq!(result.outcome, "pass");
+        assert_eq!(result.exception_count, 0);
+        assert_eq!(result.unreviewed_count, Some(0));
+        assert_eq!(result.unremediated_count, Some(0));
+        assert_eq!(result.remediation_check_applied, Some(true));
+        assert_eq!(result.ad_rows_considered, Some(2));
+        assert_eq!(result.review_rows_considered, Some(2));
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn run_matcher_recertification_skips_remediation_when_review_log_lacks_columns() {
+        // Review log has only an email column — no decision / exception_raised
+        // / remediation_status. The completeness check still runs; the
+        // remediation check is skipped cleanly and the detail JSON records
+        // remediation_check_applied = false.
+        let (db, db_path) = seeded_db("firm-rc3", "user-rc3", "client-rc3", "eng-rc3");
+        let auth = session_for("firm-rc3", "user-rc3");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-rc3".into(),
+                library_control_id: library_control_id(&db, "UAM-C-002"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+        let recert_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-rc3' AND code = 'UAM-T-002'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-rc3".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "ad_export".into(),
+                filename: "ad.csv".into(),
+                mime_type: None,
+                content: b"email,enabled\nalice@a.com,TRUE\nbob@a.com,TRUE\n".to_vec(),
+            },
+        )
+        .unwrap();
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-rc3".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "access_review".into(),
+                filename: "access_review.csv".into(),
+                mime_type: None,
+                content: b"email\nalice@a.com\n".to_vec(),
+            },
+        )
+        .unwrap();
+
+        let result = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: recert_test_id,
+                overrides: None,
+            },
+        )
+        .unwrap();
+
+        // bob is unreviewed; remediation check skipped.
+        assert_eq!(result.rule, "periodic_recertification");
+        assert_eq!(result.outcome, "exception");
+        assert_eq!(result.exception_count, 1);
+        assert_eq!(result.unreviewed_count, Some(1));
+        assert_eq!(result.unremediated_count, Some(0));
+        assert_eq!(result.remediation_check_applied, Some(false));
+
+        db.with(|conn| {
+            let detail: String = conn.query_row(
+                "SELECT detail_json FROM TestResult WHERE id = ?1",
+                params![result.test_result_id],
+                |r| r.get(0),
+            )?;
+            assert!(detail.contains("\"remediation_check_applied\":false"));
+            Ok(())
+        })
+        .unwrap();
         cleanup(&db_path);
     }
 
@@ -4663,6 +5410,402 @@ mod tests {
         assert_eq!(result.transactions_considered, Some(3));
         assert_eq!(result.duplicate_group_count, Some(0));
         assert_eq!(result.total_duplicate_rows, Some(0));
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn run_matcher_itac_boundary_flags_cluster_below_threshold() {
+        // ITAC-C-001 ships ITAC-T-003 as the boundary / threshold procedure.
+        // Seed a population with a heavy cluster at 9,900 (below the 10,000
+        // approval threshold) and only a light presence at 10,100. The
+        // matcher should flag exactly the 10,000 threshold and elevate the
+        // test to in_review.
+        let (db, db_path) =
+            seeded_db("firm-bnd1", "user-bnd1", "client-bnd1", "eng-bnd1");
+        let auth = session_for("firm-bnd1", "user-bnd1");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-bnd1".into(),
+                library_control_id: library_control_id(&db, "ITAC-C-001"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+        let bnd_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-bnd1' AND code = 'ITAC-T-003'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+
+        // 12 rows at 9,900 (meets the 10-row absolute gate), 3 at 10,100
+        // (below/above ratio 4.0 > 2.0 flag gate).
+        let mut csv = String::from("txn_id,amount\n");
+        for i in 1..=12 {
+            csv.push_str(&format!("{},9900.00\n", i));
+        }
+        for i in 13..=15 {
+            csv.push_str(&format!("{},10100.00\n", i));
+        }
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-bnd1".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "transaction_register".into(),
+                filename: "txns.csv".into(),
+                mime_type: Some("text/csv".into()),
+                content: csv.as_bytes().to_vec(),
+            },
+        )
+        .unwrap();
+
+        let result = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: bnd_test_id.clone(),
+                overrides: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.rule, "boundary_threshold");
+        assert_eq!(result.outcome, "exception");
+        assert_eq!(result.exception_count, 1);
+        assert_eq!(result.transactions_considered, Some(15));
+        assert_eq!(result.transactions_skipped_unparseable, Some(0));
+        assert_eq!(result.transactions_skipped_zero, Some(0));
+        assert_eq!(result.thresholds_flagged, Some(1));
+        // At least the 10k threshold should have been evaluated; the
+        // smaller-and-larger adjacent thresholds whose windows catch
+        // nothing do not count.
+        assert!(result.thresholds_evaluated.unwrap_or(0) >= 1);
+        // ITAC is a population-level test, no supporting import.
+        assert!(result.supporting_import_id.is_none());
+        assert_eq!(
+            result.primary_import_filename.as_deref(),
+            Some("txns.csv")
+        );
+        // Benford / duplicates counters should remain unset on this rule.
+        assert!(result.digit_rows_evaluated.is_none());
+        assert!(result.duplicate_group_count.is_none());
+
+        db.with(|conn| {
+            let (outcome, pop_label, detail): (String, String, String) = conn
+                .query_row(
+                    "SELECT outcome, population_ref_label, detail_json
+                     FROM TestResult WHERE id = ?1",
+                    params![result.test_result_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+            assert_eq!(outcome, "exception");
+            assert!(pop_label.contains("txns.csv"));
+            assert!(detail.contains("boundary_threshold"));
+            assert!(detail.contains("thresholds_flagged"));
+
+            let test_status: String = conn.query_row(
+                "SELECT status FROM Test WHERE id = ?1",
+                params![bnd_test_id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(test_status, "in_review");
+
+            let activity: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ActivityLog
+                 WHERE engagement_id = 'eng-bnd1' AND action = 'matcher_run'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(activity, 1);
+            Ok(())
+        })
+        .unwrap();
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn run_matcher_itac_boundary_passes_on_balanced_population() {
+        // Rows split evenly between the below and above windows at the
+        // 10,000 threshold — ratio 1.0, fails the 2.0 flag gate, no
+        // exception. Other thresholds have no rows in their windows so
+        // don't even count as evaluated.
+        let (db, db_path) =
+            seeded_db("firm-bnd2", "user-bnd2", "client-bnd2", "eng-bnd2");
+        let auth = session_for("firm-bnd2", "user-bnd2");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-bnd2".into(),
+                library_control_id: library_control_id(&db, "ITAC-C-001"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+        let bnd_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-bnd2' AND code = 'ITAC-T-003'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+
+        let mut csv = String::from("txn_id,amount\n");
+        for i in 1..=10 {
+            csv.push_str(&format!("{},9900.00\n", i));
+        }
+        for i in 11..=20 {
+            csv.push_str(&format!("{},10100.00\n", i));
+        }
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-bnd2".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "transaction_register".into(),
+                filename: "txns.csv".into(),
+                mime_type: None,
+                content: csv.as_bytes().to_vec(),
+            },
+        )
+        .unwrap();
+
+        let result = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: bnd_test_id,
+                overrides: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.rule, "boundary_threshold");
+        assert_eq!(result.outcome, "pass");
+        assert_eq!(result.exception_count, 0);
+        assert_eq!(result.transactions_considered, Some(20));
+        assert_eq!(result.thresholds_flagged, Some(0));
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn run_matcher_itac_recurring_flags_amount_across_many_counterparties() {
+        // ITAC-C-001 ships ITAC-T-004 as the recurring-amount procedure.
+        // Seed a population with $1,234.56 paid to 6 distinct vendors
+        // (passes both the >=5 distinct counterparties gate and the
+        // >=5 rows gate; amount well above the $100 floor) plus one
+        // unrelated $50 row that's below significance and ignored.
+        let (db, db_path) =
+            seeded_db("firm-rcr1", "user-rcr1", "client-rcr1", "eng-rcr1");
+        let auth = session_for("firm-rcr1", "user-rcr1");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-rcr1".into(),
+                library_control_id: library_control_id(&db, "ITAC-C-001"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+        let rcr_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-rcr1' AND code = 'ITAC-T-004'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+
+        let mut csv = String::from("txn_id,amount,vendor,date\n");
+        // 6 rows at $1,234.56 across 6 distinct vendors → flagged group.
+        for i in 1..=6 {
+            csv.push_str(&format!("{i},1234.56,Vendor {i},2025-03-{:02}\n", i));
+        }
+        // One small below-significance row. Should land in
+        // rows_skipped_below_significance, not in any group.
+        csv.push_str("99,50.00,Unrelated Vendor,2025-03-15\n");
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-rcr1".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "transaction_register".into(),
+                filename: "txns.csv".into(),
+                mime_type: Some("text/csv".into()),
+                content: csv.as_bytes().to_vec(),
+            },
+        )
+        .unwrap();
+
+        let result = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: rcr_test_id.clone(),
+                overrides: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.rule, "recurring_amounts");
+        assert_eq!(result.outcome, "exception");
+        assert_eq!(result.exception_count, 1);
+        assert_eq!(result.transactions_considered, Some(7));
+        assert_eq!(result.transactions_skipped_unparseable, Some(0));
+        assert_eq!(result.transactions_skipped_zero, Some(0));
+        assert_eq!(result.transactions_skipped_no_counterparty, Some(0));
+        assert_eq!(result.transactions_skipped_below_significance, Some(1));
+        assert_eq!(result.recurring_group_count, Some(1));
+        assert_eq!(result.total_recurring_rows, Some(6));
+        assert_eq!(result.recurring_min_amount_cents, Some(10_000));
+        // Recurring is a population-level test, no supporting import.
+        assert!(result.supporting_import_id.is_none());
+        assert_eq!(
+            result.primary_import_filename.as_deref(),
+            Some("txns.csv")
+        );
+        // Other-rule counters should remain unset on this rule.
+        assert!(result.digit_rows_evaluated.is_none());
+        assert!(result.duplicate_group_count.is_none());
+        assert!(result.thresholds_flagged.is_none());
+
+        db.with(|conn| {
+            let (outcome, pop_label, detail): (String, String, String) = conn
+                .query_row(
+                    "SELECT outcome, population_ref_label, detail_json
+                     FROM TestResult WHERE id = ?1",
+                    params![result.test_result_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+            assert_eq!(outcome, "exception");
+            assert!(pop_label.contains("txns.csv"));
+            assert!(detail.contains("recurring_amounts"));
+            assert!(detail.contains("recurring_group_count"));
+            assert!(detail.contains("min_distinct_counterparties"));
+
+            let test_status: String = conn.query_row(
+                "SELECT status FROM Test WHERE id = ?1",
+                params![rcr_test_id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(test_status, "in_review");
+
+            let activity: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ActivityLog
+                 WHERE engagement_id = 'eng-rcr1' AND action = 'matcher_run'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(activity, 1);
+            Ok(())
+        })
+        .unwrap();
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn run_matcher_itac_recurring_passes_on_diverse_population() {
+        // Same set of vendors but every row at a unique amount → no group
+        // can have more than one row, every group fails the 5-row gate.
+        // Result: pass, no exceptions.
+        let (db, db_path) =
+            seeded_db("firm-rcr2", "user-rcr2", "client-rcr2", "eng-rcr2");
+        let auth = session_for("firm-rcr2", "user-rcr2");
+        let blob_dir = tempfile::tempdir().unwrap();
+        let paths = paths_for(blob_dir.path());
+
+        clone_library_control(
+            &db,
+            &auth,
+            AddLibraryControlInput {
+                engagement_id: "eng-rcr2".into(),
+                library_control_id: library_control_id(&db, "ITAC-C-001"),
+                system_id: None,
+            },
+        )
+        .unwrap();
+        let rcr_test_id: String = db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM Test WHERE engagement_id = 'eng-rcr2' AND code = 'ITAC-T-004'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+
+        let mut csv = String::from("txn_id,amount,vendor,date\n");
+        for i in 1..=8 {
+            // Each row is a unique amount (300, 400, ..., 1000). No two
+            // amounts collide so no group will form.
+            csv.push_str(&format!(
+                "{i},{}.00,Vendor {i},2025-04-{:02}\n",
+                300 + (i - 1) * 100,
+                i
+            ));
+        }
+        upload_data_import(
+            &db,
+            &auth,
+            &paths,
+            UploadDataImportInput {
+                engagement_id: "eng-rcr2".into(),
+                system_id: None,
+                source_kind: "csv".into(),
+                purpose_tag: "transaction_register".into(),
+                filename: "txns.csv".into(),
+                mime_type: None,
+                content: csv.as_bytes().to_vec(),
+            },
+        )
+        .unwrap();
+
+        let result = run_matcher(
+            &db,
+            &auth,
+            &paths,
+            RunMatcherInput {
+                test_id: rcr_test_id,
+                overrides: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.rule, "recurring_amounts");
+        assert_eq!(result.outcome, "pass");
+        assert_eq!(result.exception_count, 0);
+        assert_eq!(result.transactions_considered, Some(8));
+        assert_eq!(result.recurring_group_count, Some(0));
+        assert_eq!(result.total_recurring_rows, Some(0));
         cleanup(&db_path);
     }
 }

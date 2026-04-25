@@ -45,6 +45,94 @@ export interface NewEngagementInput {
   period_end: string | null;
 }
 
+// Engagement "Today" overview — synthesised state returned by
+// `engagement_overview`. The frontend renders status counts, risk-coverage
+// strip, attention list, and recent activity from a single round-trip
+// rather than aggregating across five list endpoints.
+export interface EngagementHeader {
+  id: string;
+  name: string;
+  client_name: string;
+  status: string;
+  fiscal_year: string | null;
+  period_start: string | null;
+  period_end: string | null;
+  library_version_at_start: string;
+  created_at: number;
+  closed_at: number | null;
+  lead_partner_name: string | null;
+}
+
+export interface StatusCounts {
+  controls_total: number;
+  risks_total: number;
+  tests_total: number;
+  tests_not_started: number;
+  tests_in_progress: number;
+  tests_in_review: number;
+  tests_completed: number;
+  results_total: number;
+  results_pass: number;
+  results_exception: number;
+  results_fail: number;
+  findings_total: number;
+  findings_draft: number;
+  findings_issued: number;
+  findings_remediated: number;
+  findings_closed: number;
+  findings_critical: number;
+  findings_high: number;
+  findings_medium: number;
+  findings_low: number;
+  findings_observation: number;
+  data_imports_total: number;
+  evidence_total: number;
+}
+
+export interface RiskCoverageEntry {
+  risk_id: string;
+  risk_code: string;
+  risk_title: string;
+  inherent_rating: string;
+  residual_rating: string | null;
+  control_count: number;
+  test_count: number;
+  tests_with_results: number;
+  tests_with_exceptions: number;
+  findings_open: number;
+  // "uncovered" | "untested" | "tested_clean" | "tested_with_exceptions"
+  coverage_state: string;
+}
+
+export interface AttentionItem {
+  // Stable machine-readable kind. Common values:
+  //   "test_in_review" | "exception_no_finding" |
+  //   "finding_draft_high_severity" | "risk_no_control" | "control_no_test"
+  kind: string;
+  // "high" | "medium" | "low" — backend already orders the list.
+  priority: string;
+  label: string;
+  entity_type: string | null;
+  entity_id: string | null;
+}
+
+export interface RecentActivityEntry {
+  at: number;
+  actor_name: string | null;
+  action: string;
+  entity_type: string;
+  entity_id: string;
+  summary: string | null;
+}
+
+export interface EngagementOverview {
+  engagement: EngagementHeader;
+  status_counts: StatusCounts;
+  risk_coverage: RiskCoverageEntry[];
+  needs_attention: AttentionItem[];
+  recent_activity: RecentActivityEntry[];
+}
+
 export interface LibraryVersion {
   version: string;
   frameworks: string[];
@@ -204,6 +292,22 @@ export interface MatcherRunResult {
   transactions_skipped_no_key: number | null;
   duplicate_group_count: number | null;
   total_duplicate_rows: number | null;
+  // Boundary / threshold analysis (ITAC-T-003)
+  thresholds_evaluated: number | null;
+  thresholds_flagged: number | null;
+  // Periodic recertification (UAM-T-002)
+  review_rows_considered: number | null;
+  review_rows_skipped_unmatchable: number | null;
+  unreviewed_count: number | null;
+  unremediated_count: number | null;
+  remediation_check_applied: boolean | null;
+  remediation_window_days: number | null;
+  // Recurring-amount detection (ITAC-T-004)
+  transactions_skipped_no_counterparty: number | null;
+  transactions_skipped_below_significance: number | null;
+  recurring_group_count: number | null;
+  total_recurring_rows: number | null;
+  recurring_min_amount_cents: number | null;
 }
 
 export interface TestResultSummary {
@@ -395,6 +499,8 @@ export const api = {
   listEngagements: () => invoke<EngagementSummary[]>("list_engagements"),
   createEngagement: (input: NewEngagementInput) =>
     invoke<EngagementSummary>("create_engagement", { input }),
+  engagementOverview: (engagementId: string) =>
+    invoke<EngagementOverview>("engagement_overview", { engagementId }),
   libraryVersion: () => invoke<LibraryVersion>("library_version"),
   libraryListRisks: () => invoke<LibraryRiskSummary[]>("library_list_risks"),
   libraryListControls: () =>

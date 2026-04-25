@@ -421,6 +421,404 @@ pub fn run_dormant_accounts(ad: &Table, as_of_secs: i64, threshold_days: u32) ->
     }
 }
 
+/// Default remediation window for the periodic-recertification rule, in days.
+/// If the caller does not override, an exception whose review date is older
+/// than this and whose `remediation_status` still reads open is flagged as
+/// "unremediated". 90 days mirrors the dormancy default — most firms we've
+/// seen either operate on the same cadence for both, or run recertification
+/// quarterly and give remediation a full follow-up cycle, which is 90 days in
+/// both cases.
+pub const REMEDIATION_WINDOW_DAYS_DEFAULT: u32 = 90;
+
+const REVIEW_DATE_CANDIDATES: &[&str] = &[
+    "review_date",
+    "reviewdate",
+    "reviewed_at",
+    "reviewedat",
+    "reviewed_on",
+    "reviewedon",
+    "certification_date",
+    "certificationdate",
+    "certified_at",
+    "certifiedat",
+    "date_reviewed",
+    "datereviewed",
+];
+
+/// Explicit "was an exception raised on this review row" columns. Checked
+/// before the decision column so a dedicated boolean wins over a narrative
+/// decision label.
+const EXCEPTION_RAISED_CANDIDATES: &[&str] = &[
+    "exception_raised",
+    "exceptionraised",
+    "has_exception",
+    "hasexception",
+    "exception",
+    "is_exception",
+    "isexception",
+];
+
+/// Reviewer-decision columns, read as a fallback exception signal when the
+/// review log has no explicit `exception_raised` column. Values matching
+/// `EXCEPTION_DECISION_VALUES` are treated as "exception raised".
+const DECISION_CANDIDATES: &[&str] = &[
+    "decision",
+    "reviewer_decision",
+    "reviewerdecision",
+    "review_decision",
+    "reviewdecision",
+    "disposition",
+    "outcome",
+];
+
+const REMEDIATION_STATUS_CANDIDATES: &[&str] = &[
+    "remediation_status",
+    "remediationstatus",
+    "remediation",
+    "remediation_state",
+    "remediationstate",
+    "remediation_outcome",
+    "remediationoutcome",
+    "disposition_status",
+    "dispositionstatus",
+];
+
+/// Report for the periodic-recertification rule.
+///
+/// The rule produces two distinct exception kinds in one pass:
+///   - `unreviewed_account` — an enabled AD row whose identity does not appear
+///     in the access-review log. The population being tested is the *review
+///     log's coverage*, not the AD export; an unreviewed account is a
+///     completeness gap in the review, not a finding against the user.
+///   - `unremediated_exception` — a review-log row where the reviewer raised
+///     an exception (via an `exception_raised` column or an `exception`-type
+///     decision), the remediation status is still open, and (if a review date
+///     is present) the row is older than the configured remediation window.
+///
+/// The remediation check is opt-in on the data: it runs only when the review
+/// log carries both an exception-signal column *and* a remediation-status
+/// column. A log that has neither is still tested for completeness, and the
+/// report records `remediation_check_applied = false` so the auditor can see
+/// that the second leg was skipped by absent columns, not by zero findings.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecertificationReport {
+    pub rule: String,
+    pub ad_rows_considered: usize,
+    pub ad_rows_skipped_disabled: usize,
+    pub ad_rows_skipped_unmatchable: usize,
+    pub review_rows_considered: usize,
+    pub review_rows_skipped_unmatchable: usize,
+    pub unreviewed_count: usize,
+    pub unremediated_count: usize,
+    pub remediation_check_applied: bool,
+    pub remediation_window_days: u32,
+    pub as_of_secs: i64,
+    pub exceptions: Vec<RecertificationException>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecertificationException {
+    pub kind: String,
+    pub email: Option<String>,
+    pub logon: Option<String>,
+    /// Set for `unreviewed_account` exceptions; the 1-based ordinal of the AD
+    /// row that was not covered by the review log.
+    pub ad_ordinal: Option<usize>,
+    /// Set for `unremediated_exception`; the 1-based ordinal of the review
+    /// row that carries the unresolved exception.
+    pub review_ordinal: Option<usize>,
+    /// Set when the review row parses a valid `review_date`. `None` means
+    /// either no review-date column is present or the value was not
+    /// parseable; both cases flag the row conservatively (see `run_periodic_recertification`).
+    pub days_since_review: Option<u32>,
+    /// Raw AD row for `unreviewed_account`; empty otherwise.
+    pub ad_row: Vec<String>,
+    /// Raw review-log row for `unremediated_exception`; empty otherwise.
+    pub review_row: Vec<String>,
+}
+
+/// UAR periodic-recertification. Reconciles a dated access-review log against
+/// the enabled AD population at the review date, then checks whether any
+/// exceptions raised during the review have remained open past the remediation
+/// window.
+///
+/// Inputs:
+///   - `review_log` — rows of the access-review report. One row per user
+///     reviewed (or per exception raised, depending on the firm's format).
+///     Identity columns follow the same EMAIL/LOGON candidates as AD.
+///   - `ad` — AD (or application user) export as at the review date. Enabled
+///     rows are the authoritative population.
+///
+/// Reconciliation is email-primary with a logon fallback, matching the rest
+/// of the UAR family. AD rows whose identity cannot be extracted at all are
+/// counted in `ad_rows_skipped_unmatchable` and excluded from the
+/// completeness check; the same applies to review rows.
+///
+/// The remediation check activates when at least one exception-signal column
+/// (`exception_raised` / `has_exception` / or a `decision` column) is present
+/// *and* a `remediation_status` column is present. The signal column is read
+/// in priority order: an explicit `exception_raised` column wins over a
+/// `decision` column carrying "exception" / "revoked" / "denied" / etc., so
+/// firms whose reviewers record a conflict between the two see the explicit
+/// signal used.
+pub fn run_periodic_recertification(
+    review_log: &Table,
+    ad: &Table,
+    as_of_secs: i64,
+    remediation_window_days: u32,
+) -> RecertificationReport {
+    let ad_email_col = find_column(ad, EMAIL_CANDIDATES);
+    let ad_logon_col = find_column(ad, LOGON_CANDIDATES);
+    let ad_enabled_col = find_column(ad, ENABLED_CANDIDATES);
+
+    let review_email_col = find_column(review_log, EMAIL_CANDIDATES);
+    let review_logon_col = find_column(review_log, LOGON_CANDIDATES);
+    let review_date_col = find_column(review_log, REVIEW_DATE_CANDIDATES);
+    let exception_raised_col = find_column(review_log, EXCEPTION_RAISED_CANDIDATES);
+    let decision_col = find_column(review_log, DECISION_CANDIDATES);
+    let remediation_status_col = find_column(review_log, REMEDIATION_STATUS_CANDIDATES);
+
+    let remediation_check_applied = (exception_raised_col.is_some()
+        || decision_col.is_some())
+        && remediation_status_col.is_some();
+
+    // Build sets of reviewed identities for the completeness check. Both an
+    // email hit and a logon hit count as "this user was reviewed", mirroring
+    // the orphan-accounts convention.
+    let mut reviewed_emails: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut reviewed_logons: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut review_rows_skipped_unmatchable = 0usize;
+    for row in &review_log.rows {
+        let email = review_email_col
+            .as_ref()
+            .and_then(|c| row.values.get(c))
+            .map(|s| normalise(s))
+            .filter(|s| !s.is_empty());
+        let logon = review_logon_col
+            .as_ref()
+            .and_then(|c| row.values.get(c))
+            .map(|s| normalise(s))
+            .filter(|s| !s.is_empty());
+        if email.is_none() && logon.is_none() {
+            review_rows_skipped_unmatchable += 1;
+            continue;
+        }
+        if let Some(e) = email {
+            reviewed_emails.insert(e);
+        }
+        if let Some(l) = logon {
+            reviewed_logons.insert(l);
+        }
+    }
+
+    let mut unreviewed: Vec<RecertificationException> = Vec::new();
+    let mut ad_rows_skipped_disabled = 0usize;
+    let mut ad_rows_skipped_unmatchable = 0usize;
+
+    for ad_row in &ad.rows {
+        if !is_enabled(ad_row, ad_enabled_col.as_deref()) {
+            ad_rows_skipped_disabled += 1;
+            continue;
+        }
+
+        let ad_email = ad_email_col
+            .as_ref()
+            .and_then(|c| ad_row.values.get(c))
+            .map(|s| normalise(s))
+            .filter(|s| !s.is_empty());
+        let ad_logon = ad_logon_col
+            .as_ref()
+            .and_then(|c| ad_row.values.get(c))
+            .map(|s| normalise(s))
+            .filter(|s| !s.is_empty());
+
+        if ad_email.is_none() && ad_logon.is_none() {
+            ad_rows_skipped_unmatchable += 1;
+            continue;
+        }
+
+        let email_hit = ad_email
+            .as_ref()
+            .map(|e| reviewed_emails.contains(e))
+            .unwrap_or(false);
+        let logon_hit = ad_logon
+            .as_ref()
+            .map(|l| reviewed_logons.contains(l))
+            .unwrap_or(false);
+
+        if !(email_hit || logon_hit) {
+            unreviewed.push(RecertificationException {
+                kind: "unreviewed_account".into(),
+                email: ad_email,
+                logon: ad_logon,
+                ad_ordinal: Some(ad_row.ordinal),
+                review_ordinal: None,
+                days_since_review: None,
+                ad_row: ad_row.raw_values.clone(),
+                review_row: Vec::new(),
+            });
+        }
+    }
+
+    let mut unremediated: Vec<RecertificationException> = Vec::new();
+    if remediation_check_applied {
+        let threshold_secs = remediation_window_days as i64 * 86_400;
+
+        for row in &review_log.rows {
+            let exception_raised = if let Some(col) = exception_raised_col.as_ref() {
+                // Dedicated boolean column: read only this. An explicit "no"
+                // wins over a decision column that might disagree.
+                row.values
+                    .get(col)
+                    .map(|v| is_exception_raised_flag(v))
+                    .unwrap_or(false)
+            } else if let Some(col) = decision_col.as_ref() {
+                row.values
+                    .get(col)
+                    .map(|v| is_exception_decision(v))
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            if !exception_raised {
+                continue;
+            }
+
+            // Must not be remediated. Absent / empty / unrecognised
+            // remediation_status counts as "still open" — more conservative
+            // than the firm's schema implies, but deliberately so: a value the
+            // rule doesn't recognise shouldn't silently close an exception.
+            let remediation_open = remediation_status_col
+                .as_ref()
+                .and_then(|c| row.values.get(c))
+                .map(|v| !is_remediated(v))
+                .unwrap_or(true);
+            if !remediation_open {
+                continue;
+            }
+
+            // Age gate. If a review_date column exists and parses: apply the
+            // window. If the column exists but the value is blank/unparseable:
+            // flag conservatively (can't verify grace). If no column at all:
+            // flag conservatively (no grace to apply).
+            let days_since = review_date_col
+                .as_ref()
+                .and_then(|c| row.values.get(c))
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .and_then(|s| parse_last_logon(s))
+                .map(|review_secs| {
+                    let delta = (as_of_secs - review_secs).max(0);
+                    (delta / 86_400).clamp(0, u32::MAX as i64) as u32
+                });
+            let is_stale = match days_since {
+                Some(d) => (d as i64) * 86_400 >= threshold_secs,
+                None => true,
+            };
+            if !is_stale {
+                continue;
+            }
+
+            let email = review_email_col
+                .as_ref()
+                .and_then(|c| row.values.get(c))
+                .map(|s| normalise(s))
+                .filter(|s| !s.is_empty());
+            let logon = review_logon_col
+                .as_ref()
+                .and_then(|c| row.values.get(c))
+                .map(|s| normalise(s))
+                .filter(|s| !s.is_empty());
+
+            unremediated.push(RecertificationException {
+                kind: "unremediated_exception".into(),
+                email,
+                logon,
+                ad_ordinal: None,
+                review_ordinal: Some(row.ordinal),
+                days_since_review: days_since,
+                ad_row: Vec::new(),
+                review_row: row.raw_values.clone(),
+            });
+        }
+    }
+
+    let unreviewed_count = unreviewed.len();
+    let unremediated_count = unremediated.len();
+
+    let mut exceptions = Vec::with_capacity(unreviewed_count + unremediated_count);
+    exceptions.extend(unreviewed);
+    exceptions.extend(unremediated);
+
+    RecertificationReport {
+        rule: "periodic_recertification".into(),
+        ad_rows_considered: ad.rows.len(),
+        ad_rows_skipped_disabled,
+        ad_rows_skipped_unmatchable,
+        review_rows_considered: review_log.rows.len(),
+        review_rows_skipped_unmatchable,
+        unreviewed_count,
+        unremediated_count,
+        remediation_check_applied,
+        remediation_window_days,
+        as_of_secs,
+        exceptions,
+    }
+}
+
+fn is_exception_raised_flag(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "yes" | "y" | "true" | "1" | "raised" | "exception" | "flagged"
+    )
+}
+
+fn is_exception_decision(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "exception"
+            | "exceptions"
+            | "revoke"
+            | "revoked"
+            | "remove"
+            | "removed"
+            | "reject"
+            | "rejected"
+            | "deny"
+            | "denied"
+            | "fail"
+            | "failed"
+            | "non-compliant"
+            | "noncompliant"
+            | "not_approved"
+            | "notapproved"
+            | "not approved"
+    )
+}
+
+fn is_remediated(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "closed"
+            | "close"
+            | "complete"
+            | "completed"
+            | "done"
+            | "remediated"
+            | "resolved"
+            | "accepted"
+            | "risk_accepted"
+            | "riskaccepted"
+            | "risk-accepted"
+            | "approved"
+            | "passed"
+            | "fixed"
+            | "cleared"
+    )
+}
+
 /// Parse a last-logon value into Unix epoch seconds. Tries, in order:
 ///   - the marker strings "never" / "none" / "null" / "0" → returns Some(0)
 ///     so callers can tell "never signed in" apart from "unparseable"
@@ -813,5 +1211,298 @@ mod tests {
         let report = run_orphan_accounts(&ad, &hr_master);
 
         assert!(report.exceptions.is_empty());
+    }
+
+    // ---- Periodic recertification (UAM-T-002) ----
+
+    #[test]
+    fn recert_flags_ad_accounts_missing_from_review_log() {
+        // alice + bob are in the review log; carol is enabled in AD but not
+        // reviewed → one unreviewed_account exception.
+        let ad = parse(
+            "sAMAccountName,email,enabled\n\
+             alice,alice@acme.com,TRUE\n\
+             bob,bob@acme.com,TRUE\n\
+             carol,carol@acme.com,TRUE\n",
+        )
+        .unwrap();
+        let review = parse(
+            "email\n\
+             alice@acme.com\n\
+             bob@acme.com\n",
+        )
+        .unwrap();
+
+        let report = run_periodic_recertification(&review, &ad, AS_OF_2025_06_01, 90);
+
+        assert_eq!(report.unreviewed_count, 1);
+        assert_eq!(report.unremediated_count, 0);
+        assert_eq!(report.ad_rows_considered, 3);
+        assert_eq!(report.review_rows_considered, 2);
+        let sample = &report.exceptions[0];
+        assert_eq!(sample.kind, "unreviewed_account");
+        assert_eq!(sample.email.as_deref(), Some("carol@acme.com"));
+        assert_eq!(report.remediation_check_applied, false);
+    }
+
+    #[test]
+    fn recert_ignores_disabled_ad_rows_in_completeness_check() {
+        // A disabled AD account that's not in the review log is not an
+        // exception — same convention as orphan-accounts.
+        let ad = parse(
+            "sAMAccountName,email,enabled\n\
+             alice,alice@acme.com,TRUE\n\
+             ghost,ghost@acme.com,FALSE\n",
+        )
+        .unwrap();
+        let review = parse("email\nalice@acme.com\n").unwrap();
+
+        let report = run_periodic_recertification(&review, &ad, AS_OF_2025_06_01, 90);
+
+        assert_eq!(report.unreviewed_count, 0);
+        assert_eq!(report.ad_rows_skipped_disabled, 1);
+        assert_eq!(report.ad_rows_considered, 2);
+    }
+
+    #[test]
+    fn recert_passes_when_every_enabled_ad_row_is_reviewed_and_no_exceptions() {
+        let ad = parse(
+            "sAMAccountName,email,enabled\n\
+             alice,alice@acme.com,TRUE\n\
+             bob,bob@acme.com,TRUE\n",
+        )
+        .unwrap();
+        let review = parse(
+            "email,decision,remediation_status\n\
+             alice@acme.com,approved,closed\n\
+             bob@acme.com,approved,closed\n",
+        )
+        .unwrap();
+
+        let report = run_periodic_recertification(&review, &ad, AS_OF_2025_06_01, 90);
+
+        assert_eq!(report.unreviewed_count, 0);
+        assert_eq!(report.unremediated_count, 0);
+        assert!(report.exceptions.is_empty());
+        assert_eq!(report.remediation_check_applied, true);
+    }
+
+    #[test]
+    fn recert_flags_unremediated_exception_past_the_window() {
+        // bob's review happened 2024-11-01 (>= 90 days before 2025-06-01),
+        // the decision is "exception", and remediation_status is still open →
+        // one unremediated_exception.
+        let ad = parse(
+            "email,enabled\n\
+             alice@acme.com,TRUE\n\
+             bob@acme.com,TRUE\n",
+        )
+        .unwrap();
+        let review = parse(
+            "email,review_date,decision,remediation_status\n\
+             alice@acme.com,2024-11-01,approved,closed\n\
+             bob@acme.com,2024-11-01,exception,open\n",
+        )
+        .unwrap();
+
+        let report = run_periodic_recertification(&review, &ad, AS_OF_2025_06_01, 90);
+
+        assert_eq!(report.unreviewed_count, 0);
+        assert_eq!(report.unremediated_count, 1);
+        assert_eq!(report.remediation_check_applied, true);
+        let sample = &report.exceptions[0];
+        assert_eq!(sample.kind, "unremediated_exception");
+        assert_eq!(sample.email.as_deref(), Some("bob@acme.com"));
+        assert!(sample.days_since_review.unwrap() >= 90);
+    }
+
+    #[test]
+    fn recert_does_not_flag_recent_exception_inside_window() {
+        // bob's review happened 2025-05-01 (~31 days before as_of); still
+        // inside the 90-day remediation window.
+        let ad = parse("email,enabled\nbob@acme.com,TRUE\n").unwrap();
+        let review = parse(
+            "email,review_date,decision,remediation_status\n\
+             bob@acme.com,2025-05-01,exception,open\n",
+        )
+        .unwrap();
+
+        let report = run_periodic_recertification(&review, &ad, AS_OF_2025_06_01, 90);
+
+        assert_eq!(report.unremediated_count, 0);
+    }
+
+    #[test]
+    fn recert_flags_unremediated_when_review_date_is_absent_on_row() {
+        // An exception row with no review_date should flag conservatively
+        // rather than silently pass.
+        let ad = parse("email,enabled\nbob@acme.com,TRUE\n").unwrap();
+        let review = parse(
+            "email,review_date,decision,remediation_status\n\
+             bob@acme.com,,exception,open\n",
+        )
+        .unwrap();
+
+        let report = run_periodic_recertification(&review, &ad, AS_OF_2025_06_01, 90);
+
+        assert_eq!(report.unremediated_count, 1);
+        assert!(report.exceptions[0].days_since_review.is_none());
+    }
+
+    #[test]
+    fn recert_flags_unremediated_when_review_date_column_is_missing() {
+        // No review_date column at all: same conservative behaviour.
+        let ad = parse("email,enabled\nbob@acme.com,TRUE\n").unwrap();
+        let review = parse(
+            "email,decision,remediation_status\n\
+             bob@acme.com,exception,open\n",
+        )
+        .unwrap();
+
+        let report = run_periodic_recertification(&review, &ad, AS_OF_2025_06_01, 90);
+
+        assert_eq!(report.unremediated_count, 1);
+    }
+
+    #[test]
+    fn recert_flags_unremediated_when_review_date_unparseable() {
+        let ad = parse("email,enabled\nbob@acme.com,TRUE\n").unwrap();
+        let review = parse(
+            "email,review_date,decision,remediation_status\n\
+             bob@acme.com,not-a-date,exception,open\n",
+        )
+        .unwrap();
+
+        let report = run_periodic_recertification(&review, &ad, AS_OF_2025_06_01, 90);
+
+        assert_eq!(report.unremediated_count, 1);
+        assert!(report.exceptions[0].days_since_review.is_none());
+    }
+
+    #[test]
+    fn recert_treats_empty_remediation_status_as_open() {
+        // A present remediation_status column whose value is blank is
+        // treated as still open. Firms that omit remediation data shouldn't
+        // have that silently close an exception.
+        let ad = parse("email,enabled\nbob@acme.com,TRUE\n").unwrap();
+        let review = parse(
+            "email,review_date,decision,remediation_status\n\
+             bob@acme.com,2024-11-01,exception,\n",
+        )
+        .unwrap();
+
+        let report = run_periodic_recertification(&review, &ad, AS_OF_2025_06_01, 90);
+
+        assert_eq!(report.unremediated_count, 1);
+    }
+
+    #[test]
+    fn recert_skips_remediation_check_without_exception_signal_column() {
+        // Review log has remediation_status but no exception/decision column.
+        // We can't tell which rows were exceptions, so the check is skipped.
+        let ad = parse("email,enabled\nbob@acme.com,TRUE\n").unwrap();
+        let review = parse(
+            "email,review_date,remediation_status\n\
+             bob@acme.com,2024-11-01,open\n",
+        )
+        .unwrap();
+
+        let report = run_periodic_recertification(&review, &ad, AS_OF_2025_06_01, 90);
+
+        assert_eq!(report.remediation_check_applied, false);
+        assert_eq!(report.unremediated_count, 0);
+    }
+
+    #[test]
+    fn recert_skips_remediation_check_without_remediation_status_column() {
+        // Exception column present but no remediation_status → skip.
+        let ad = parse("email,enabled\nbob@acme.com,TRUE\n").unwrap();
+        let review = parse(
+            "email,review_date,decision\n\
+             bob@acme.com,2024-11-01,exception\n",
+        )
+        .unwrap();
+
+        let report = run_periodic_recertification(&review, &ad, AS_OF_2025_06_01, 90);
+
+        assert_eq!(report.remediation_check_applied, false);
+        assert_eq!(report.unremediated_count, 0);
+    }
+
+    #[test]
+    fn recert_explicit_exception_raised_column_beats_decision_disagreement() {
+        // exception_raised=no with decision=exception should NOT flag the
+        // row; the dedicated boolean wins.
+        let ad = parse("email,enabled\nbob@acme.com,TRUE\n").unwrap();
+        let review = parse(
+            "email,review_date,exception_raised,decision,remediation_status\n\
+             bob@acme.com,2024-11-01,no,exception,open\n",
+        )
+        .unwrap();
+
+        let report = run_periodic_recertification(&review, &ad, AS_OF_2025_06_01, 90);
+
+        assert_eq!(report.remediation_check_applied, true);
+        assert_eq!(report.unremediated_count, 0);
+    }
+
+    #[test]
+    fn recert_logon_fallback_works_when_review_log_has_no_email_column() {
+        // Review log is logon-only; AD has both. Completeness match should
+        // still hit via the logon fallback.
+        let ad = parse(
+            "sAMAccountName,email,enabled\n\
+             alice,alice@acme.com,TRUE\n\
+             bob,bob@acme.com,TRUE\n",
+        )
+        .unwrap();
+        let review = parse("logon_name\nalice\n").unwrap();
+
+        let report = run_periodic_recertification(&review, &ad, AS_OF_2025_06_01, 90);
+
+        assert_eq!(report.unreviewed_count, 1);
+        assert_eq!(report.exceptions[0].logon.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn recert_skips_review_rows_with_neither_email_nor_logon() {
+        // A review row that can't be canonicalised gets counted in
+        // review_rows_skipped_unmatchable and excluded from the reviewed set,
+        // so any AD row it was meant to cover will surface as unreviewed.
+        let ad = parse("email,enabled\nalice@acme.com,TRUE\n").unwrap();
+        let review = parse("email,notes\n,nothing\n").unwrap();
+
+        let report = run_periodic_recertification(&review, &ad, AS_OF_2025_06_01, 90);
+
+        assert_eq!(report.review_rows_skipped_unmatchable, 1);
+        assert_eq!(report.unreviewed_count, 1);
+    }
+
+    #[test]
+    fn recert_both_kinds_of_exception_in_one_run() {
+        // carol is unreviewed; bob is unremediated. Mixed-exception run.
+        let ad = parse(
+            "email,enabled\n\
+             alice@acme.com,TRUE\n\
+             bob@acme.com,TRUE\n\
+             carol@acme.com,TRUE\n",
+        )
+        .unwrap();
+        let review = parse(
+            "email,review_date,decision,remediation_status\n\
+             alice@acme.com,2024-11-01,approved,closed\n\
+             bob@acme.com,2024-11-01,exception,open\n",
+        )
+        .unwrap();
+
+        let report = run_periodic_recertification(&review, &ad, AS_OF_2025_06_01, 90);
+
+        assert_eq!(report.unreviewed_count, 1);
+        assert_eq!(report.unremediated_count, 1);
+        assert_eq!(report.exceptions.len(), 2);
+        // unreviewed come first, then unremediated (see ordering in
+        // run_periodic_recertification).
+        assert_eq!(report.exceptions[0].kind, "unreviewed_account");
+        assert_eq!(report.exceptions[1].kind, "unremediated_exception");
     }
 }

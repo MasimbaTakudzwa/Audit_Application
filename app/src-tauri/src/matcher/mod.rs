@@ -12,4 +12,6 @@ pub mod backup;
 pub mod change_management;
 pub mod csv;
 pub mod itac_benford;
+pub mod itac_boundary;
 pub mod itac_duplicates;
+pub mod itac_recurring;

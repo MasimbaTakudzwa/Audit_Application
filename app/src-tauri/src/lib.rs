@@ -60,6 +60,7 @@ pub fn run() {
             commands::clients::create_client,
             commands::engagements::list_engagements,
             commands::engagements::create_engagement,
+            commands::engagements::engagement_overview,
             commands::library::library_version,
             commands::library::library_list_risks,
             commands::library::library_list_controls,

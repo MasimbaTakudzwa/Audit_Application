@@ -3,6 +3,7 @@
   import {
     api,
     type DataImportSummary,
+    type EngagementOverview,
     type EngagementSummary,
     type EvidenceSummary,
     type FindingSummary,
@@ -31,6 +32,7 @@
     | "transaction_register"
     | "deploy_permissions"
     | "source_access"
+    | "access_review"
     | "other";
 
   const PURPOSE_OPTIONS: { id: PurposeTag; label: string; hint: string }[] = [
@@ -46,6 +48,7 @@
     { id: "transaction_register", label: "Transaction register", hint: "Export of the in-scope transaction population, with an amount column" },
     { id: "deploy_permissions", label: "Deploy permissions", hint: "Production deployment tool's role or permission matrix (for dev-vs-deploy SoD)" },
     { id: "source_access", label: "Source repository access", hint: "Source host or change-authoring tool's access export (for dev-vs-deploy SoD)" },
+    { id: "access_review", label: "Access-review log", hint: "Periodic recertification sign-off: one row per reviewed user, optionally with decision, review_date, and remediation_status columns" },
     { id: "other",       label: "Other",           hint: "Any other evidence you want to retain" },
   ];
 
@@ -55,6 +58,7 @@
   // pressed.
   const MATCHER_ENABLED_CODES = new Set([
     "UAM-T-001",
+    "UAM-T-002",
     "UAM-T-003",
     "UAM-T-004",
     "CHG-T-001",
@@ -62,12 +66,15 @@
     "BKP-T-001",
     "ITAC-T-001",
     "ITAC-T-002",
+    "ITAC-T-003",
+    "ITAC-T-004",
   ]);
 
   let loading = $state(true);
   let err = $state("");
 
   let engagement = $state<EngagementSummary | null>(null);
+  let overview = $state<EngagementOverview | null>(null);
   let imports = $state<DataImportSummary[]>([]);
   let tests = $state<TestSummary[]>([]);
   let results = $state<TestResultSummary[]>([]);
@@ -132,16 +139,25 @@
     loading = true;
     err = "";
     try {
-      const [all, dataImports, testList, resultList, findingList, severityList, evidenceList] =
-        await Promise.all([
-          api.listEngagements(),
-          api.engagementListDataImports(id),
-          api.engagementListTests(id),
-          api.engagementListTestResults(id),
-          api.engagementListFindings(id),
-          api.listFindingSeverities(),
-          api.engagementListEvidence(id),
-        ]);
+      const [
+        all,
+        ov,
+        dataImports,
+        testList,
+        resultList,
+        findingList,
+        severityList,
+        evidenceList,
+      ] = await Promise.all([
+        api.listEngagements(),
+        api.engagementOverview(id),
+        api.engagementListDataImports(id),
+        api.engagementListTests(id),
+        api.engagementListTestResults(id),
+        api.engagementListFindings(id),
+        api.listFindingSeverities(),
+        api.engagementListEvidence(id),
+      ]);
       const match = all.find((e) => e.id === id);
       if (!match) {
         err = "Engagement not found. It may have been removed.";
@@ -149,6 +165,7 @@
       } else {
         engagement = match;
       }
+      overview = ov;
       imports = dataImports;
       tests = testList;
       results = resultList;
@@ -165,6 +182,22 @@
   function back() {
     currentEngagementId.set(null);
     currentRoute.set("engagements");
+  }
+
+  // Narrow refresh — re-pull just the overview synthesis after a mutation.
+  // Cheaper than calling load() (which would re-fetch every table on the
+  // page) and keeps the counters / risk strip / activity timeline in sync
+  // with what the auditor has just done.
+  async function refreshOverview() {
+    if (!engagement) return;
+    try {
+      overview = await api.engagementOverview(engagement.id);
+    } catch (e) {
+      // Leave the prior overview visible on failure rather than blanking
+      // it out — the user has the rest of the page; an Overview-refresh
+      // hiccup shouldn't blow up the surface.
+      console.warn("overview refresh failed", e);
+    }
   }
 
   function openUpload() {
@@ -215,6 +248,7 @@
       showUpload = false;
       selectedFile = null;
       if (fileInput) fileInput.value = "";
+      await refreshOverview();
     } catch (e) {
       uploadErr = String(e);
     } finally {
@@ -258,6 +292,7 @@
       });
       tests = await api.engagementListTests(engagement.id);
       showLibraryPicker = false;
+      await refreshOverview();
     } catch (e) {
       addControlErr = String(e);
     } finally {
@@ -268,6 +303,7 @@
   function onFindingSaved(updated: FindingSummary) {
     findings = findings.map((f) => (f.id === updated.id ? updated : f));
     editingFindingId = null;
+    void refreshOverview();
   }
 
   async function elevateFinding(result: TestResultSummary) {
@@ -286,6 +322,7 @@
       ]);
       results = refreshedResults;
       findings = refreshedFindings;
+      await refreshOverview();
     } catch (e) {
       elevateErr = String(e);
     } finally {
@@ -310,6 +347,7 @@
       tests = refreshedTests;
       results = refreshedResults;
       evidence = refreshedEvidence;
+      await refreshOverview();
     } catch (e) {
       runErr = String(e);
     } finally {
@@ -364,6 +402,7 @@
       showEvidenceUpload = false;
       evFile = null;
       if (evFileInput) evFileInput.value = "";
+      await refreshOverview();
     } catch (e) {
       evidenceUploadErr = String(e);
     } finally {
@@ -452,6 +491,62 @@
   function severityPillClass(id: string | null): string {
     return id ? `pill pill-${id}` : "pill";
   }
+
+  // -------- Today / Overview helpers --------
+
+  function coverageStateLabel(state: string): string {
+    switch (state) {
+      case "uncovered":
+        return "No controls linked";
+      case "untested":
+        return "Controls in place, no test results yet";
+      case "tested_clean":
+        return "Tested, no exceptions";
+      case "tested_with_exceptions":
+        return "Tested, exceptions raised";
+      default:
+        return state;
+    }
+  }
+
+  function ratingPillClass(rating: string): string {
+    return `pill pill-rating-${rating.toLowerCase()}`;
+  }
+
+  function inflect(n: number, singular: string, plural?: string): string {
+    return n === 1 ? singular : plural ?? `${singular}s`;
+  }
+
+  // Humanise an ActivityLog action token. Tokens come in as e.g.
+  // "matcher_run", "created", "elevate_to_finding"; render them in
+  // sentence case with spaces.
+  function formatActivityAction(action: string): string {
+    const normalised = action.replace(/_/g, " ").trim();
+    if (!normalised) return action;
+    return normalised.charAt(0).toUpperCase() + normalised.slice(1);
+  }
+
+  // Turn a Unix epoch (seconds) into "n minutes ago" / "yesterday" /
+  // "3 days ago" — short form used in the activity timeline. Falls back
+  // to the full date for anything older than a week.
+  function relativeTime(secs: number): string {
+    const now = Math.floor(Date.now() / 1000);
+    const delta = now - secs;
+    if (delta < 60) return "Just now";
+    if (delta < 3600) {
+      const m = Math.floor(delta / 60);
+      return `${m} ${inflect(m, "minute")} ago`;
+    }
+    if (delta < 86400) {
+      const h = Math.floor(delta / 3600);
+      return `${h} ${inflect(h, "hour")} ago`;
+    }
+    if (delta < 86400 * 7) {
+      const d = Math.floor(delta / 86400);
+      return `${d} ${inflect(d, "day")} ago`;
+    }
+    return fmtDate(secs);
+  }
 </script>
 
 <header>
@@ -473,6 +568,178 @@
 <hr />
 
 {#if !loading && !err && engagement}
+  {#if overview}
+    <section class="block overview">
+      <div class="block-head">
+        <div>
+          <h2>Today</h2>
+          <p class="muted">
+            {#if overview.engagement.period_start && overview.engagement.period_end}
+              Period {overview.engagement.period_start} → {overview.engagement.period_end} ·
+            {/if}
+            {overview.engagement.client_name} ·
+            <span class="accent">{overview.engagement.status}</span>
+            {#if overview.engagement.lead_partner_name}
+              · Led by {overview.engagement.lead_partner_name}
+            {/if}
+            · Library {overview.engagement.library_version_at_start}
+          </p>
+        </div>
+      </div>
+
+      <!-- Status counters -->
+      <div class="overview-grid">
+        <div class="overview-card">
+          <span class="label">Risks</span>
+          <p class="stat">{overview.status_counts.risks_total}</p>
+          {#if overview.status_counts.risks_total === 0}
+            <p class="faint">Add a library control to seed risks</p>
+          {:else}
+            {@const uncovered = overview.risk_coverage.filter(
+              (r) => r.coverage_state === "uncovered",
+            ).length}
+            {@const untested = overview.risk_coverage.filter(
+              (r) => r.coverage_state === "untested",
+            ).length}
+            {@const flagged = overview.risk_coverage.filter(
+              (r) => r.coverage_state === "tested_with_exceptions",
+            ).length}
+            <p class="faint">
+              {uncovered} uncovered · {untested} untested · {flagged} flagged
+            </p>
+          {/if}
+        </div>
+
+        <div class="overview-card">
+          <span class="label">Tests</span>
+          <p class="stat">{overview.status_counts.tests_total}</p>
+          {#if overview.status_counts.tests_total === 0}
+            <p class="faint">No procedures yet</p>
+          {:else}
+            <p class="faint">
+              {overview.status_counts.tests_in_review}
+              in review ·
+              {overview.status_counts.tests_completed}
+              completed ·
+              {overview.status_counts.tests_not_started}
+              not started
+            </p>
+          {/if}
+        </div>
+
+        <div class="overview-card">
+          <span class="label">Findings</span>
+          <p class="stat">{overview.status_counts.findings_total}</p>
+          {#if overview.status_counts.findings_total === 0}
+            <p class="faint">No findings raised</p>
+          {:else}
+            <p class="faint">
+              {overview.status_counts.findings_critical +
+                overview.status_counts.findings_high}
+              critical/high ·
+              {overview.status_counts.findings_draft}
+              draft ·
+              {overview.status_counts.findings_closed}
+              closed
+            </p>
+          {/if}
+        </div>
+
+        <div class="overview-card">
+          <span class="label">Evidence</span>
+          <p class="stat">{overview.status_counts.evidence_total}</p>
+          <p class="faint">
+            {overview.status_counts.data_imports_total}
+            {inflect(overview.status_counts.data_imports_total, "import")} ·
+            {overview.status_counts.results_exception +
+              overview.status_counts.results_fail}
+            matcher
+            {inflect(
+              overview.status_counts.results_exception +
+                overview.status_counts.results_fail,
+              "exception",
+            )}
+          </p>
+        </div>
+      </div>
+
+      <!-- Risk coverage strip -->
+      {#if overview.risk_coverage.length > 0}
+        <div class="overview-section">
+          <h3>Risk coverage</h3>
+          <div class="risk-strip">
+            {#each overview.risk_coverage as risk (risk.risk_id)}
+              <article class="risk-card cov-{risk.coverage_state}">
+                <div class="risk-card-head">
+                  <span class="label">{risk.risk_code}</span>
+                  <span class={ratingPillClass(risk.inherent_rating)}
+                    >{risk.inherent_rating}</span
+                  >
+                </div>
+                <p class="risk-title">{risk.risk_title}</p>
+                <p class="faint coverage-state">
+                  {coverageStateLabel(risk.coverage_state)}
+                </p>
+                <p class="faint risk-counts">
+                  {risk.control_count}
+                  {inflect(risk.control_count, "ctrl", "ctrls")} ·
+                  {risk.test_count}
+                  {inflect(risk.test_count, "test")} ·
+                  {risk.findings_open}
+                  open
+                </p>
+              </article>
+            {/each}
+          </div>
+        </div>
+      {/if}
+
+      <!-- Two-column row: needs attention + recent activity -->
+      <div class="two-col">
+        <div class="overview-section">
+          <h3>Needs attention</h3>
+          {#if overview.needs_attention.length === 0}
+            <p class="muted">Nothing pending. Worth a moment to review?</p>
+          {:else}
+            <ul class="attention-list">
+              {#each overview.needs_attention as item, idx (idx)}
+                <li class="attention-item priority-{item.priority}">
+                  <span class="dot" aria-hidden="true"></span>
+                  <span class="attention-label">{item.label}</span>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
+
+        <div class="overview-section">
+          <h3>Recent activity</h3>
+          {#if overview.recent_activity.length === 0}
+            <p class="muted">No activity yet.</p>
+          {:else}
+            <ul class="activity-list">
+              {#each overview.recent_activity as entry, idx (idx)}
+                <li>
+                  <span class="faint when">{relativeTime(entry.at)}</span>
+                  <span class="what">
+                    <strong>{entry.actor_name ?? "Someone"}</strong>
+                    {formatActivityAction(entry.action)}
+                    <span class="faint">
+                      on {entry.entity_type}
+                    </span>
+                  </span>
+                  {#if entry.summary}
+                    <span class="faint summary-line">{entry.summary}</span>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
+      </div>
+    </section>
+  {/if}
+
   <section class="block">
     <div class="block-head">
       <div>
@@ -1179,4 +1446,156 @@
     padding: 1px 6px;
     border-radius: 2px;
   }
+
+  /* -------- Today / Overview block -------- */
+
+  .overview { margin-top: var(--sp-4); }
+
+  .overview-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: var(--sp-4);
+    margin-bottom: var(--sp-5);
+  }
+  .overview-card {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: var(--sp-4);
+    background: var(--bg);
+  }
+  .overview-card .label {
+    font-size: 11px;
+    color: var(--text-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .overview-card .stat {
+    margin: var(--sp-2) 0 var(--sp-1) 0;
+    font-family: var(--font-serif);
+    font-size: 28px;
+    font-weight: 400;
+    line-height: 1;
+    color: var(--text);
+  }
+  .overview-card .faint {
+    font-size: 12px;
+    margin: 0;
+  }
+
+  .overview-section { margin-top: var(--sp-5); }
+  .overview-section h3 {
+    margin: 0 0 var(--sp-3) 0;
+    font-size: 14px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+  }
+
+  .risk-strip {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: var(--sp-3);
+  }
+  .risk-card {
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--text-faint);
+    border-radius: 6px;
+    padding: var(--sp-3) var(--sp-4);
+    background: var(--bg);
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+  }
+  .risk-card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: var(--sp-2);
+  }
+  .risk-card .label {
+    font-size: 11px;
+    color: var(--text-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .risk-card .risk-title {
+    font-size: 13px;
+    margin: 0;
+    color: var(--text);
+    line-height: 1.35;
+  }
+  .risk-card .coverage-state,
+  .risk-card .risk-counts {
+    font-size: 11px;
+    margin: 0;
+  }
+  /* Coverage-state colour-codes the left rail. Low-saturation tones so the
+     row reads as informational, not alarming. */
+  .risk-card.cov-uncovered             { border-left-color: #b07a2d; }
+  .risk-card.cov-untested              { border-left-color: var(--text-faint); }
+  .risk-card.cov-tested_clean          { border-left-color: #2d7a4a; }
+  .risk-card.cov-tested_with_exceptions{ border-left-color: #b04040; }
+
+  /* Inherent-rating pills mirror the severity scale visually but use
+     distinct class names so future restyling can fork them. */
+  .pill-rating-high    { color: #b04040; border-color: #e0a8a8; }
+  .pill-rating-medium  { color: #b07a2d; border-color: #e3c99b; }
+  .pill-rating-low     { color: #2d7a4a; border-color: #8fcfa2; }
+
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--sp-5);
+    margin-top: var(--sp-5);
+  }
+  @media (max-width: 800px) {
+    .two-col { grid-template-columns: 1fr; }
+  }
+
+  .attention-list,
+  .activity-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+  }
+  .attention-item {
+    display: flex;
+    gap: var(--sp-3);
+    align-items: flex-start;
+    font-size: 13px;
+    line-height: 1.45;
+    padding: var(--sp-2) 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .attention-item:last-child { border-bottom: 0; }
+  .attention-item .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-top: 6px;
+    flex-shrink: 0;
+    background: var(--text-faint);
+  }
+  .attention-item.priority-high .dot   { background: #b04040; }
+  .attention-item.priority-medium .dot { background: #b07a2d; }
+  .attention-item.priority-low .dot    { background: var(--text-faint); }
+  .attention-label { flex: 1; }
+
+  .activity-list li {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 13px;
+    line-height: 1.4;
+    padding: var(--sp-2) 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .activity-list li:last-child { border-bottom: 0; }
+  .activity-list .when { font-size: 11px; }
+  .activity-list .what { font-size: 13px; }
+  .activity-list .summary-line { font-size: 12px; }
 </style>

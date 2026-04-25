@@ -39,7 +39,10 @@ use super::itac_benford::{parse_amount, AMOUNT_CANDIDATES};
 /// of the transaction: vendor, customer, payee, beneficiary, etc. Deliberately
 /// broad since transaction exports differ wildly between AP, AR, GL, and
 /// treasury systems.
-const COUNTERPARTY_CANDIDATES: &[&str] = &[
+/// Exposed `pub(super)` so sibling ITAC matchers (recurring-amount
+/// detection in particular) can reuse the same counterparty header
+/// resolution. Single source of truth across the family.
+pub(super) const COUNTERPARTY_CANDIDATES: &[&str] = &[
     "counterparty",
     "vendor",
     "vendor_name",

@@ -19,6 +19,7 @@
 
   const MATCHER_ENABLED_CODES = new Set([
     "UAM-T-001",
+    "UAM-T-002",
     "UAM-T-003",
     "UAM-T-004",
     "CHG-T-001",
@@ -26,6 +27,8 @@
     "BKP-T-001",
     "ITAC-T-001",
     "ITAC-T-002",
+    "ITAC-T-003",
+    "ITAC-T-004",
   ]);
 
   let loading = $state(true);

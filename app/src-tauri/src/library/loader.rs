@@ -50,6 +50,16 @@ const BUNDLE_V0_5_0: &[u8] =
 const BUNDLE_V0_5_0_SIG: &str =
     include_str!("../../resources/library/v0.5.0.json.sig");
 
+const BUNDLE_V0_6_0: &[u8] =
+    include_bytes!("../../resources/library/v0.6.0.json");
+const BUNDLE_V0_6_0_SIG: &str =
+    include_str!("../../resources/library/v0.6.0.json.sig");
+
+const BUNDLE_V0_7_0: &[u8] =
+    include_bytes!("../../resources/library/v0.7.0.json");
+const BUNDLE_V0_7_0_SIG: &str =
+    include_str!("../../resources/library/v0.7.0.json.sig");
+
 /// Install every baseline bundle shipped with the app into `conn`. Idempotent.
 pub fn install_baseline_bundles(conn: &mut Connection) -> AppResult<()> {
     install_bundle(conn, BUNDLE_V0_1_0, BUNDLE_V0_1_0_SIG)?;
@@ -57,6 +67,8 @@ pub fn install_baseline_bundles(conn: &mut Connection) -> AppResult<()> {
     install_bundle(conn, BUNDLE_V0_3_0, BUNDLE_V0_3_0_SIG)?;
     install_bundle(conn, BUNDLE_V0_4_0, BUNDLE_V0_4_0_SIG)?;
     install_bundle(conn, BUNDLE_V0_5_0, BUNDLE_V0_5_0_SIG)?;
+    install_bundle(conn, BUNDLE_V0_6_0, BUNDLE_V0_6_0_SIG)?;
+    install_bundle(conn, BUNDLE_V0_7_0, BUNDLE_V0_7_0_SIG)?;
     Ok(())
 }
 
@@ -394,7 +406,7 @@ mod tests {
         db.with(|conn| {
             // Every prior bundle's rows remain in the DB with
             // `superseded_by` pointing at the same-code row in the next
-            // bundle up. Only v0.5.0's rows have `superseded_by IS NULL`.
+            // bundle up. Only v0.7.0's rows have `superseded_by IS NULL`.
             let risks_v1: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM LibraryRisk WHERE library_version = '0.1.0'",
                 [],
@@ -425,6 +437,18 @@ mod tests {
                 |r| r.get(0),
             )?;
             assert_eq!(risks_v5, 4);
+            let risks_v6: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM LibraryRisk WHERE library_version = '0.6.0'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(risks_v6, 4);
+            let risks_v7: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM LibraryRisk WHERE library_version = '0.7.0'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(risks_v7, 4);
             let risks_v1_superseded: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM LibraryRisk
                  WHERE library_version = '0.1.0' AND superseded_by IS NOT NULL",
@@ -453,13 +477,27 @@ mod tests {
                 |r| r.get(0),
             )?;
             assert_eq!(risks_v4_superseded, 4);
-            let risks_v5_current: i64 = conn.query_row(
+            let risks_v5_superseded: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM LibraryRisk
-                 WHERE library_version = '0.5.0' AND superseded_by IS NULL",
+                 WHERE library_version = '0.5.0' AND superseded_by IS NOT NULL",
                 [],
                 |r| r.get(0),
             )?;
-            assert_eq!(risks_v5_current, 4);
+            assert_eq!(risks_v5_superseded, 4);
+            let risks_v6_superseded: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM LibraryRisk
+                 WHERE library_version = '0.6.0' AND superseded_by IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(risks_v6_superseded, 4);
+            let risks_v7_current: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM LibraryRisk
+                 WHERE library_version = '0.7.0' AND superseded_by IS NULL",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(risks_v7_current, 4);
 
             let controls_v1: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM LibraryControl WHERE library_version = '0.1.0'",
@@ -491,6 +529,18 @@ mod tests {
                 |r| r.get(0),
             )?;
             assert_eq!(controls_v5, 6);
+            let controls_v6: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM LibraryControl WHERE library_version = '0.6.0'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(controls_v6, 6);
+            let controls_v7: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM LibraryControl WHERE library_version = '0.7.0'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(controls_v7, 6);
 
             let test_procedures_v1: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM TestProcedure WHERE library_version = '0.1.0'",
@@ -522,12 +572,27 @@ mod tests {
                 |r| r.get(0),
             )?;
             assert_eq!(test_procedures_v5, 9);
+            let test_procedures_v6: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM TestProcedure WHERE library_version = '0.6.0'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(test_procedures_v6, 10);
+            let test_procedures_v7: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM TestProcedure WHERE library_version = '0.7.0'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(test_procedures_v7, 11);
 
             // v0.2.0 introduced UAM-T-003 (dormant accounts); v0.3.0
             // introduced UAM-T-004 (orphan accounts); v0.4.0 introduced
-            // ITAC-T-001 (Benford first-digit analysis); v0.5.0 introduces
-            // ITAC-T-002 (duplicate-transaction detection). Each should be
-            // present at its introducing version.
+            // ITAC-T-001 (Benford first-digit analysis); v0.5.0 introduced
+            // ITAC-T-002 (duplicate-transaction detection); v0.6.0
+            // introduced ITAC-T-003 (boundary / threshold analysis); v0.7.0
+            // introduces ITAC-T-004 (recurring-amount detection across
+            // counterparties). Each should be present at its introducing
+            // version.
             let dormant_present: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM TestProcedure
                  WHERE code = 'UAM-T-003' AND library_version = '0.2.0'",
@@ -556,6 +621,20 @@ mod tests {
                 |r| r.get(0),
             )?;
             assert_eq!(duplicate_present, 1);
+            let boundary_present: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM TestProcedure
+                 WHERE code = 'ITAC-T-003' AND library_version = '0.6.0'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(boundary_present, 1);
+            let recurring_present: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM TestProcedure
+                 WHERE code = 'ITAC-T-004' AND library_version = '0.7.0'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(recurring_present, 1);
 
             let checklists_v2: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM ExpectedEvidenceChecklist WHERE library_version = '0.2.0'",
@@ -581,10 +660,22 @@ mod tests {
                 |r| r.get(0),
             )?;
             assert_eq!(checklists_v5, 9);
+            let checklists_v6: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ExpectedEvidenceChecklist WHERE library_version = '0.6.0'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(checklists_v6, 10);
+            let checklists_v7: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ExpectedEvidenceChecklist WHERE library_version = '0.7.0'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(checklists_v7, 11);
 
             // Each control carries 2 framework mappings. 5 controls per
-            // version × 2 = 10 per version; v0.4.0 and v0.5.0 each have 6
-            // controls → 12.
+            // version × 2 = 10 per version; v0.4.0, v0.5.0, v0.6.0, v0.7.0
+            // each have 6 controls → 12.
             let mappings_v1: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM FrameworkMapping WHERE library_version = '0.1.0'",
                 [],
@@ -615,6 +706,18 @@ mod tests {
                 |r| r.get(0),
             )?;
             assert_eq!(mappings_v5, 12);
+            let mappings_v6: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM FrameworkMapping WHERE library_version = '0.6.0'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(mappings_v6, 12);
+            let mappings_v7: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM FrameworkMapping WHERE library_version = '0.7.0'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(mappings_v7, 12);
             Ok(())
         })
         .unwrap();
