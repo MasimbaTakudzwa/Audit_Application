@@ -1,0 +1,263 @@
+{
+  "version": "0.3.0",
+  "published_at": 1776988800,
+  "frameworks_included": ["COBIT 2019", "NIST CSF"],
+  "risks": [
+    {
+      "code": "UAM-R-001",
+      "title": "Inappropriate user access is retained after role change or termination",
+      "description": "Users retain access rights beyond the period justified by their role, either because access is not revoked when employment ends or because role changes do not trigger a review of the access that is no longer required. The residual access may be used, intentionally or otherwise, to perform actions the user is no longer authorised to perform.",
+      "applicable_system_types": ["generic-erp", "core-banking"],
+      "default_inherent_rating": "high"
+    },
+    {
+      "code": "CHG-R-001",
+      "title": "Unauthorised changes reach the production environment",
+      "description": "Changes to application code, configuration, or infrastructure reach production without appropriate approval, testing, or segregation of duties. Unauthorised changes may introduce defects, weaken controls, or permit fraud.",
+      "applicable_system_types": ["generic-erp", "core-banking"],
+      "default_inherent_rating": "high"
+    },
+    {
+      "code": "BKP-R-001",
+      "title": "Data loss cannot be recovered within the time the business can tolerate",
+      "description": "Backups are not taken, not tested, not stored securely, or take longer to restore than the business's recovery time objective. A destructive incident leaves the organisation unable to resume operations in the required window.",
+      "applicable_system_types": ["generic-erp", "core-banking"],
+      "default_inherent_rating": "medium"
+    }
+  ],
+  "controls": [
+    {
+      "code": "UAM-C-001",
+      "title": "Access is provisioned on the basis of a documented, approved request",
+      "description": "A user's application access is created only on the basis of a request that identifies the user, the role or profile to be granted, and the approver. The request is retained and can be produced for any given account.",
+      "objective": "Prevent the creation of application access without an identifiable business owner authorising it.",
+      "applicable_system_types": ["generic-erp", "core-banking"],
+      "control_type": "preventive",
+      "frequency": "event-based",
+      "related_risk_codes": ["UAM-R-001"],
+      "framework_mappings": [
+        {"framework": "COBIT 2019", "reference": "DSS05.04"},
+        {"framework": "NIST CSF", "reference": "PR.AC-1"}
+      ]
+    },
+    {
+      "code": "UAM-C-002",
+      "title": "User access is reviewed on a recurring basis and exceptions are remediated",
+      "description": "Management performs a periodic review of application users and their assigned access. The reviewer confirms that each account is still required and that the access granted is still appropriate to the user's role. Exceptions are tracked to closure.",
+      "objective": "Detect and correct residual access that is no longer justified by the user's role.",
+      "applicable_system_types": ["generic-erp", "core-banking"],
+      "control_type": "detective",
+      "frequency": "quarterly",
+      "related_risk_codes": ["UAM-R-001"],
+      "framework_mappings": [
+        {"framework": "COBIT 2019", "reference": "DSS05.04"},
+        {"framework": "NIST CSF", "reference": "PR.AC-4"}
+      ]
+    },
+    {
+      "code": "CHG-C-001",
+      "title": "Changes to production are approved in advance by an authorised approver",
+      "description": "Every change to production requires documented approval from an authorised approver prior to deployment. The approval identifies the change, the approver, and the date. Emergency changes follow a documented exception path with retrospective review.",
+      "objective": "Prevent deployment of changes that have not been reviewed and authorised.",
+      "applicable_system_types": ["generic-erp", "core-banking"],
+      "control_type": "preventive",
+      "frequency": "event-based",
+      "related_risk_codes": ["CHG-R-001"],
+      "framework_mappings": [
+        {"framework": "COBIT 2019", "reference": "BAI06.01"},
+        {"framework": "NIST CSF", "reference": "PR.IP-3"}
+      ]
+    },
+    {
+      "code": "CHG-C-002",
+      "title": "The developer of a change cannot unilaterally deploy it to production",
+      "description": "Segregation of duties is enforced between change development and change deployment. No single individual can both author a change and release it to production without a second individual's involvement, whether by system-enforced role separation or a documented, monitored compensating control.",
+      "objective": "Prevent an individual from bypassing review by deploying their own changes.",
+      "applicable_system_types": ["generic-erp", "core-banking"],
+      "control_type": "preventive",
+      "frequency": "continuous",
+      "related_risk_codes": ["CHG-R-001"],
+      "framework_mappings": [
+        {"framework": "COBIT 2019", "reference": "BAI06.01"},
+        {"framework": "NIST CSF", "reference": "PR.AC-4"}
+      ]
+    },
+    {
+      "code": "BKP-C-001",
+      "title": "Backups are taken on a defined schedule and their restoration is tested",
+      "description": "Backups of the in-scope systems are taken at the frequency defined in the backup policy, stored in a location separate from the primary system, and test-restored on a recurring basis. Restoration test results are retained, including any exceptions and their remediation.",
+      "objective": "Demonstrate that the organisation can recover from a destructive incident within its declared recovery time objective.",
+      "applicable_system_types": ["generic-erp", "core-banking"],
+      "control_type": "corrective",
+      "frequency": "monthly",
+      "related_risk_codes": ["BKP-R-001"],
+      "framework_mappings": [
+        {"framework": "COBIT 2019", "reference": "DSS04.07"},
+        {"framework": "NIST CSF", "reference": "PR.IP-4"}
+      ]
+    }
+  ],
+  "test_procedures": [
+    {
+      "code": "UAM-T-001",
+      "control_code": "UAM-C-001",
+      "name": "Access provisioning traceability",
+      "objective": "For a sample of accounts created during the period, confirm that each was created on the basis of a documented, approved request identifying the user, the role, and the approver.",
+      "steps": [
+        "Obtain the complete list of user accounts created in the in-scope application during the audit period.",
+        "Select a sample in line with the engagement's sampling approach (default: attribute sampling).",
+        "For each sampled account, obtain the provisioning request and approval evidence.",
+        "Inspect each to confirm the user identity, role granted, and approver are present and that the approver is authorised to approve access to the relevant role.",
+        "For any sampled account where a request or approval cannot be produced, or where the approver is not authorised, record an exception."
+      ],
+      "sampling_default": "attribute",
+      "automation_hint": "rule-based",
+      "evidence_checklist": {
+        "items": [
+          "Complete list of accounts created during the period, extracted from the application.",
+          "Provisioning request for each sampled account, including requested role and requester identity.",
+          "Approval record for each sampled account, including approver identity and date.",
+          "Authorised approver list for the role(s) in question, in effect during the period."
+        ]
+      }
+    },
+    {
+      "code": "UAM-T-002",
+      "control_code": "UAM-C-002",
+      "name": "User access review completeness and remediation",
+      "objective": "Confirm that user access reviews were performed at the stated frequency, covered the full population of users at the review date, and that exceptions raised were tracked to remediation.",
+      "steps": [
+        "Obtain the list of access reviews performed during the period and the underlying population of users reviewed in each.",
+        "Reconcile the population reviewed to the application's user list as at the review date.",
+        "Inspect the reviewer's sign-off evidence for each review.",
+        "For a sample of exceptions raised during the reviews, obtain evidence that each was remediated or formally accepted.",
+        "Record an exception where a review was missed, a portion of the population was omitted, or an exception was not remediated within the stated remediation window."
+      ],
+      "sampling_default": "attribute",
+      "automation_hint": "rule-based",
+      "evidence_checklist": {
+        "items": [
+          "Access review report or sign-off for each review in the period.",
+          "User list extracted from the application as at the review date, for reconciliation.",
+          "Exception log with status and remediation evidence for each exception raised."
+        ]
+      }
+    },
+    {
+      "code": "UAM-T-003",
+      "control_code": "UAM-C-002",
+      "name": "Review of dormant application accounts",
+      "objective": "Confirm that enabled accounts whose last sign-in is older than the organisation's defined activity window have either been disabled or formally justified as retained.",
+      "steps": [
+        "Obtain an AD (or Entra) export of application accounts as at the review date, including enablement status and last sign-in timestamp.",
+        "Confirm the organisation's defined dormancy threshold (commonly 90 days for standard users, shorter for privileged roles).",
+        "Run the dormant-accounts matcher against the export; it flags every enabled account whose last sign-in is older than the threshold, plus accounts that have never signed in.",
+        "For each flagged account, obtain either evidence that the account has since been disabled, or the business justification for retaining it (for example: service accounts, leave of absence, shared operational mailboxes).",
+        "Record an exception where an account is flagged, remains enabled, and has no accepted justification."
+      ],
+      "sampling_default": "none",
+      "automation_hint": "rule-based",
+      "evidence_checklist": {
+        "items": [
+          "AD or Entra export of application accounts as at the review date, including enablement status and last sign-in timestamp.",
+          "Documented dormancy threshold in the organisation's access management policy, with role-based variants if any.",
+          "Disablement evidence or documented business justification for each flagged account."
+        ]
+      }
+    },
+    {
+      "code": "UAM-T-004",
+      "control_code": "UAM-C-002",
+      "name": "Review of orphan application accounts",
+      "objective": "Confirm that enabled application accounts held by individuals who are not current employees have been disabled or formally justified as retained.",
+      "steps": [
+        "Obtain an AD (or Entra) export of application accounts as at the review date, including enablement status and identifier columns (email or logon name).",
+        "Obtain the HR master list of current employees as at the same review date, including the same identifier columns used for matching.",
+        "Confirm that the HR master excludes terminated employees (those belong on the leavers list consumed by the terminated-but-active matcher, not here).",
+        "Run the orphan-accounts matcher; it flags every enabled AD account whose identifier does not appear anywhere in the HR master.",
+        "For each flagged account, obtain evidence of one of: (a) disablement; (b) formal classification as a service or shared account with a named owner; (c) a documented justification for retaining it despite the gap in HR records.",
+        "Record an exception where an account remains enabled with no HR record and no accepted classification or justification."
+      ],
+      "sampling_default": "none",
+      "automation_hint": "rule-based",
+      "evidence_checklist": {
+        "items": [
+          "AD or Entra export of application accounts as at the review date, including enablement status.",
+          "HR master list of current employees as at the review date, with the same identifier columns used for matching (email and/or logon name).",
+          "Service-account register or equivalent classification record, if relied on to exclude non-employee accounts.",
+          "Disablement evidence or documented business justification for each flagged account not classified as a service account."
+        ]
+      }
+    },
+    {
+      "code": "CHG-T-001",
+      "control_code": "CHG-C-001",
+      "name": "Change approval before production deployment",
+      "objective": "For a sample of production changes deployed during the period, confirm that each was approved in advance by an authorised approver.",
+      "steps": [
+        "Obtain the complete list of production changes deployed during the audit period.",
+        "Select a sample in line with the engagement's sampling approach.",
+        "For each sampled change, obtain the approval record and the deployment record.",
+        "Inspect each to confirm the approval was granted before the deployment timestamp and that the approver is on the authorised approver list for the change type and environment.",
+        "For emergency changes, additionally inspect the retrospective review record.",
+        "Record an exception where approval was absent, granted after deployment, or granted by an unauthorised approver."
+      ],
+      "sampling_default": "attribute",
+      "automation_hint": "rule-based",
+      "evidence_checklist": {
+        "items": [
+          "Complete list of production changes deployed in the period, with deployment timestamps.",
+          "Change approval record for each sampled change.",
+          "Authorised approver list for the period, by environment or change type.",
+          "Retrospective review record for each sampled emergency change, if applicable."
+        ]
+      }
+    },
+    {
+      "code": "CHG-T-002",
+      "control_code": "CHG-C-002",
+      "name": "Segregation of duties between development and deployment",
+      "objective": "Confirm that no individual can both author a change and deploy it to production, either through system-enforced role separation or through a documented, monitored compensating control.",
+      "steps": [
+        "Obtain the production deployment tool's role or permission matrix.",
+        "Identify the population of users with deploy-to-production permission.",
+        "Identify the population of users with write access to the source repository or change authoring tool.",
+        "Compute the intersection; for each user in the intersection, obtain evidence of the compensating control (e.g. four-eyes review, post-deployment monitoring) and its operation during the period.",
+        "Record an exception where an individual had both permissions and no compensating control was evidenced, or where the compensating control did not operate consistently."
+      ],
+      "sampling_default": "none",
+      "automation_hint": "rule-based",
+      "evidence_checklist": {
+        "items": [
+          "Production deployment tool's permission export, including role assignments.",
+          "Source repository or change authoring tool's access export.",
+          "Documented compensating control, where relied on, and evidence of its operation during the period."
+        ]
+      }
+    },
+    {
+      "code": "BKP-T-001",
+      "control_code": "BKP-C-001",
+      "name": "Backup performance and restoration testing",
+      "objective": "Confirm that backups were taken on schedule during the period, stored in a separate location, and test-restored with results retained.",
+      "steps": [
+        "Obtain the backup schedule and the backup job log for the period.",
+        "Inspect the log to confirm each scheduled backup either completed successfully or was followed by a rerun that completed.",
+        "For a sample of backup dates, inspect evidence that the backup was stored in the separate location stated in the backup policy.",
+        "Obtain the restoration test log for the period and the retained test results.",
+        "For each restoration test in the sample, inspect evidence that the test was performed, whether it succeeded, and the remediation of any failure.",
+        "Record an exception where a scheduled backup failed without a successful rerun, a backup was not stored per policy, or a restoration test was skipped or failed without remediation."
+      ],
+      "sampling_default": "attribute",
+      "automation_hint": "rule-based",
+      "evidence_checklist": {
+        "items": [
+          "Backup policy in effect during the period, including schedule and storage location.",
+          "Backup job log covering the full period.",
+          "Evidence of storage location for sampled backup dates.",
+          "Restoration test log and retained restoration test results, with remediation evidence for any failed test."
+        ]
+      }
+    }
+  ]
+}

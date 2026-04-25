@@ -4,11 +4,13 @@
 #![allow(dead_code)]
 
 mod auth;
+mod blobs;
 mod commands;
 mod crypto;
 mod db;
 mod error;
 mod library;
+mod matcher;
 mod models;
 mod paths;
 
@@ -58,10 +60,27 @@ pub fn run() {
             commands::clients::create_client,
             commands::engagements::list_engagements,
             commands::engagements::create_engagement,
+            commands::engagements::engagement_overview,
             commands::library::library_version,
             commands::library::library_list_risks,
             commands::library::library_list_controls,
             commands::library::library_get_control,
+            commands::testing::engagement_add_library_control,
+            commands::testing::engagement_upload_data_import,
+            commands::testing::engagement_list_data_imports,
+            commands::testing::engagement_list_tests,
+            commands::testing::engagement_run_matcher,
+            commands::testing::engagement_list_test_results,
+            commands::findings::engagement_elevate_finding,
+            commands::findings::engagement_update_finding,
+            commands::findings::engagement_list_findings,
+            commands::findings::list_finding_severities,
+            commands::evidence::engagement_list_evidence,
+            commands::evidence::engagement_upload_evidence,
+            commands::evidence::engagement_download_evidence,
+            commands::evidence::finding_attach_evidence,
+            commands::evidence::finding_detach_evidence,
+            commands::evidence::finding_list_evidence,
         ])
         .run(tauri::generate_context!())
         .expect("failed to launch audit application");
